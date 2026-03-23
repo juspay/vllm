@@ -52,12 +52,19 @@ class KimiK2ReasoningParser(ReasoningParser):
         self._end_token = "</think>"
         self._tool_section_start_token = "<|tool_calls_section_begin|>"
 
+        # Alternative end tokens the model may hallucinate instead of
+        # the canonical </think>. When encountered, these are treated
+        # as reasoning-end markers so that content after them is not
+        # swallowed into the reasoning block.
+        self._alt_end_token = "</thinking>"
+
         # Get token IDs
         self._start_token_id = self.vocab.get(self._start_token)
         self._end_token_id = self.vocab.get(self._end_token)
         self._tool_section_start_token_id = self.vocab.get(
             self._tool_section_start_token
         )
+        self._alt_end_token_id = self.vocab.get(self._alt_end_token)
 
         if self._start_token_id is None or self._end_token_id is None:
             raise RuntimeError(
@@ -71,19 +78,27 @@ class KimiK2ReasoningParser(ReasoningParser):
 
         Reasoning ends when we see either:
         1. The end token (</think>)
-        2. The tool section start token (<|tool_calls_section_begin|>)
+        2. The alternative end token (</thinking>)
+        3. The tool section start token (<|tool_calls_section_begin|>)
         """
         if self._identity_parser is not None:
             return self._identity_parser.is_reasoning_end(input_ids)
 
         start_token_id = self._start_token_id
         end_token_id = self._end_token_id
+        alt_end_token_id = self._alt_end_token_id
         tool_section_start_token_id = self._tool_section_start_token_id
 
         for i in range(len(input_ids) - 1, -1, -1):
             if input_ids[i] == start_token_id:
                 return False
             if input_ids[i] == end_token_id:
+                return True
+            # Alternative end token (</thinking>)
+            if (
+                alt_end_token_id is not None
+                and input_ids[i] == alt_end_token_id
+            ):
                 return True
             # Implicit reasoning end via tool call section
             if (
@@ -110,6 +125,12 @@ class KimiK2ReasoningParser(ReasoningParser):
         # Check for explicit end token or implicit tool section start in delta
         if self._end_token_id in delta_ids_set:
             return True
+        # Alternative end token (</thinking>)
+        if (
+            self._alt_end_token_id is not None
+            and self._alt_end_token_id in delta_ids_set
+        ):
+            return True
         return (
             self._tool_section_start_token_id is not None
             and self._tool_section_start_token_id in delta_ids_set
@@ -129,6 +150,20 @@ class KimiK2ReasoningParser(ReasoningParser):
 
             if end_token_index != -1:
                 return input_ids[end_token_index + 1 :]
+
+        # Alternative end token (</thinking>)
+        if (
+            self._alt_end_token_id is not None
+            and self._alt_end_token_id in input_ids
+        ):
+            alt_end_index = (
+                len(input_ids)
+                - 1
+                - input_ids[::-1].index(self._alt_end_token_id)
+            )
+
+            if alt_end_index != -1:
+                return input_ids[alt_end_index + 1 :]
 
         if (
             self._tool_section_start_token_id is not None
@@ -164,6 +199,14 @@ class KimiK2ReasoningParser(ReasoningParser):
             return (
                 model_output[start_token_index:end_token_index],
                 model_output[end_token_index + len(self._end_token) :] or None,
+            )
+
+        # Check for alternative end token (</thinking>)
+        alt_end_index = model_output.find(self._alt_end_token)
+        if alt_end_index != -1:
+            return (
+                model_output[start_token_index:alt_end_index],
+                model_output[alt_end_index + len(self._alt_end_token) :] or None,
             )
 
         tool_section_index = model_output.find(self._tool_section_start_token)
@@ -206,10 +249,10 @@ class KimiK2ReasoningParser(ReasoningParser):
             return DeltaMessage(content=delta_text)
 
         # Skip single special tokens
-        if len(delta_token_ids) == 1 and delta_token_ids[0] in [
-            self._start_token_id,
-            self._end_token_id,
-        ]:
+        skip_token_ids = [self._start_token_id, self._end_token_id]
+        if self._alt_end_token_id is not None:
+            skip_token_ids.append(self._alt_end_token_id)
+        if len(delta_token_ids) == 1 and delta_token_ids[0] in skip_token_ids:
             return None
 
         if self._end_token_id in delta_token_ids:
@@ -219,6 +262,19 @@ class KimiK2ReasoningParser(ReasoningParser):
             return DeltaMessage(
                 reasoning=reasoning, content=content if content else None
             )
+
+        # Alternative end token (</thinking>) in delta
+        if (
+            self._alt_end_token_id is not None
+            and self._alt_end_token_id in delta_token_ids
+        ):
+            alt_end_index = delta_text.find(self._alt_end_token)
+            if alt_end_index != -1:
+                reasoning = delta_text[:alt_end_index]
+                content = delta_text[alt_end_index + len(self._alt_end_token) :]
+                return DeltaMessage(
+                    reasoning=reasoning, content=content if content else None
+                )
 
         if self._tool_section_start_token_id in delta_token_ids:
             tool_index = delta_text.find(self._tool_section_start_token)
