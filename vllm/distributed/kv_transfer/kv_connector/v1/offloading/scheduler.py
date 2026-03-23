@@ -31,7 +31,12 @@ class OffloadingConnectorScheduler:
 
     def __init__(self, spec: OffloadingSpec):
         assert len(spec.gpu_block_size) == 1
-        self.gpu_block_size = spec.gpu_block_size[0]
+        assert len(spec.scheduler_block_size) == 1
+
+        # Scheduler block size: tokens per block from the scheduler's
+        # perspective (CP-adjusted). Block hashes and block IDs from
+        # the KV cache manager both use this granularity.
+        self.gpu_block_size = spec.scheduler_block_size[0]
         self.offloaded_block_size = self.gpu_block_size * spec.block_size_factor
         self.block_size_factor = spec.block_size_factor
         self.manager: OffloadingManager = spec.get_manager()

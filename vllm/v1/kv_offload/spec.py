@@ -36,13 +36,32 @@ class OffloadingSpec(ABC):
         # block size used by vLLM for hashing request tokens for the sake
         # of enabling prefix caching
         self.hash_block_size = vllm_config.cache_config.block_size
-        # gpu block size per group
+
+        # Context parallelism (DCP/PCP) multiplier. With CP, each logical
+        # block covers cp_world_size * raw_block_size tokens, but each
+        # worker only stores raw_block_size tokens per block ID in its
+        # GPU tensor.
+        parallel_config = vllm_config.parallel_config
+        self.cp_world_size = (
+            parallel_config.decode_context_parallel_size
+            * parallel_config.prefill_context_parallel_size
+        )
+
+        # Physical GPU block size per group (raw, for worker data transfer)
         self.gpu_block_size: tuple[int, ...] = tuple(
             kv_cache_group.kv_cache_spec.block_size
             for kv_cache_group in kv_cache_config.kv_cache_groups
         )
 
-        for block_size in self.gpu_block_size:
+        # Scheduler block size per group (CP-adjusted, for block hash math).
+        # Block hashes are computed at scheduler_block_size granularity
+        # (see core.py scheduler_block_size), so the offloading scheduler
+        # must use this size for assertions involving block_hashes.
+        self.scheduler_block_size: tuple[int, ...] = tuple(
+            bs * self.cp_world_size for bs in self.gpu_block_size
+        )
+
+        for block_size in self.scheduler_block_size:
             assert block_size % self.hash_block_size == 0
 
         # offloaded_block_size / gpu_block_size
