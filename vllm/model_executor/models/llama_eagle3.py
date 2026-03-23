@@ -48,9 +48,8 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         config = config or vllm_config.model_config.hf_config
         quant_config = self.get_quant_config(vllm_config)
 
-        # First layer uses 2*hidden_size (embeds + hidden_states concatenated)
-        # Subsequent layers use hidden_size (only hidden_states, no embeds)
-        qkv_input_size = 2 * self.hidden_size if layer_idx == 0 else self.hidden_size
+        # All layers use 2*hidden_size (embeds + hidden_states concatenated)
+        qkv_input_size = 2 * self.hidden_size
 
         # Parallel drafting checkpoints may have attention bias enabled
         qkv_bias = getattr(config, "attention_bias", False)
@@ -100,13 +99,14 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.layer_idx == 0:
-            # First layer: concatenate embeds with hidden_states
+            # First layer: no residual yet
             embeds = self.input_layernorm(embeds)
             hidden_states, residual = self._residual_norm(hidden_states=hidden_states)
-            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         else:
-            # Subsequent layers: process hidden_states and residuals only
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            # Subsequent layers: fused add+norm on hidden_states + residual
+            embeds = self.input_layernorm(embeds)
+            hidden_states, residual = self.hidden_norm(hidden_states, residual)
+        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
         # Self Attention
         hidden_states = self.self_attn(
