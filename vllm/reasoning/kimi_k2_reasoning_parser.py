@@ -83,6 +83,18 @@ class KimiK2ReasoningParser(ReasoningParser):
                 "tokens in the tokenizer!"
             )
 
+    def _is_identity_mode(self) -> bool:
+        """Check if parser is in identity mode (no reasoning extraction)."""
+        return self._identity_parser is not None
+
+    def _trim_at_tool_boundary(self, content: str) -> str | None:
+        """Trim content at the tool section start boundary."""
+        idx = content.find(self._tool_section_start_token)
+        if idx != -1:
+            content = content[:idx]
+        return content if content else None
+
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
         Check if the reasoning content ends in the input_ids.
@@ -259,13 +271,11 @@ class KimiK2ReasoningParser(ReasoningParser):
             )
 
         if self.is_reasoning_end(previous_token_ids):
-            # Strip tool-related special tokens from content to prevent
-            # the degenerate output detector from flagging them as
-            # leaked control tokens. The model may generate tool call
-            # tokens after reasoning ends via </think> or via
-            # <|tool_calls_section_begin|> — both cases need stripping.
-            content = _TOOL_SPECIAL_TOKEN_PATTERN.sub("", delta_text)
-            return DeltaMessage(content=content if content else None)
+            # Reasoning already ended in a prior delta. Trim content at
+            # the first tool token boundary — everything from a tool
+            # control token onwards is tool call data, not user content.
+            content = self._trim_at_tool_boundary(delta_text)
+            return DeltaMessage(content=content)
 
         # Skip single special tokens
         skip_token_ids = [self._start_token_id, self._end_token_id]
@@ -278,9 +288,8 @@ class KimiK2ReasoningParser(ReasoningParser):
             end_index = delta_text.find(self._end_token)
             reasoning = delta_text[:end_index]
             content = delta_text[end_index + len(self._end_token) :]
-            return DeltaMessage(
-                reasoning=reasoning, content=content if content else None
-            )
+            content = self._trim_at_tool_boundary(content) if content else None
+            return DeltaMessage(reasoning=reasoning, content=content)
 
         # Alternative end token (</thinking>) in delta
         if (
@@ -291,22 +300,21 @@ class KimiK2ReasoningParser(ReasoningParser):
             if alt_end_index != -1:
                 reasoning = delta_text[:alt_end_index]
                 content = delta_text[alt_end_index + len(self._alt_end_token) :]
-                return DeltaMessage(
-                    reasoning=reasoning, content=content if content else None
+                content = (
+                    self._trim_at_tool_boundary(content) if content else None
                 )
+                return DeltaMessage(reasoning=reasoning, content=content)
 
         if self._tool_section_start_token_id in delta_token_ids:
             tool_index = delta_text.find(self._tool_section_start_token)
             reasoning = delta_text[:tool_index]
-            # Strip the tool section start token from content, consistent
-            # with how </think> and </thinking> end tokens are stripped.
-            # The token is a control marker, not user-visible content.
+            # Everything from the tool section start token onwards is
+            # tool call data — trim it all from content.
             content = delta_text[
                 tool_index + len(self._tool_section_start_token) :
             ]
-            return DeltaMessage(
-                reasoning=reasoning, content=content if content else None
-            )
+            content = self._trim_at_tool_boundary(content) if content else None
+            return DeltaMessage(reasoning=reasoning, content=content)
 
         # still reasoning (no end token)
         return DeltaMessage(reasoning=delta_text)
