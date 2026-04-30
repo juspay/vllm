@@ -153,7 +153,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         # Alternative end token (</thinking>)
         if (
             self._alt_end_token_id is not None
-            and self._alt_end_token_id in delta_ids
+            and self._alt_end_token_id in delta_ids_set
         ):
             return True
         return (
