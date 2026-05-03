@@ -31,6 +31,7 @@ function parseArgs(argv) {
     keepStream: false,
     saveAll: false,
     stopOnMalformed: true,
+    validateAssistantJson: true,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -62,6 +63,11 @@ function parseArgs(argv) {
     else if (arg === "--save-all") args.saveAll = true;
     else if (arg === "--no-stop-on-malformed") args.stopOnMalformed = false;
     else if (arg === "--stop-on-malformed") args.stopOnMalformed = true;
+    else if (arg === "--no-validate-assistant-json") {
+      args.validateAssistantJson = false;
+    } else if (arg === "--validate-assistant-json") {
+      args.validateAssistantJson = true;
+    }
     else if (arg === "--help" || arg === "-h") {
       printHelp();
       process.exit(0);
@@ -105,6 +111,7 @@ Options:
   --delay-s N                       Sleep between attempts per worker
   --save-all                        Save every response
   --no-stop-on-malformed            Continue after malformed/error capture
+  --no-validate-assistant-json      Do not validate assistant message.content JSON
   --keep-stream                     Do not force stream=false
 `);
 }
@@ -265,6 +272,99 @@ function malformedToolCallDetails(responseJson, schemas) {
   return details;
 }
 
+function invalidAssistantJsonOutputDetails(responseJson) {
+  const details = [];
+  const choices = Array.isArray(responseJson?.choices) ? responseJson.choices : [];
+
+  choices.forEach((choice, fallbackChoiceIndex) => {
+    const message = choice?.message;
+    if (!message || typeof message !== "object") {
+      details.push({
+        choice_index: choice?.index ?? fallbackChoiceIndex,
+        reason: "missing assistant message object",
+        content: undefined,
+      });
+      return;
+    }
+
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    if (toolCalls.length > 0) {
+      return;
+    }
+
+    const content = message.content;
+    if (typeof content !== "string" || content.length === 0) {
+      details.push({
+        choice_index: choice?.index ?? fallbackChoiceIndex,
+        reason: `missing assistant content and no tool calls; got ${jsonTypeName(content)}`,
+        content,
+      });
+      return;
+    }
+
+    let parsedContent;
+    try {
+      parsedContent = JSON.parse(content);
+    } catch (error) {
+      details.push({
+        choice_index: choice?.index ?? fallbackChoiceIndex,
+        reason: `assistant content is not valid JSON: ${error.message}`,
+        content,
+      });
+      return;
+    }
+
+    const schemaErrors = validateAskAiResponseShape(parsedContent);
+    if (schemaErrors.length > 0) {
+      details.push({
+        choice_index: choice?.index ?? fallbackChoiceIndex,
+        reason: `assistant JSON shape mismatch: ${schemaErrors.join("; ")}`,
+        content,
+        parsed_content: parsedContent,
+      });
+    }
+  });
+
+  return details;
+}
+
+function validateAskAiResponseShape(value) {
+  const errors = [];
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return [`$ expected object got ${jsonTypeName(value)}`];
+  }
+
+  const requiredKeys = ["summary", "keypoints", "citations", "userTags"];
+  for (const key of requiredKeys) {
+    if (!(key in value)) errors.push(`$.${key} is required but missing`);
+  }
+
+  if ("summary" in value && typeof value.summary !== "string") {
+    errors.push(`$.summary expected string got ${jsonTypeName(value.summary)}`);
+  }
+  if ("keypoints" in value && !Array.isArray(value.keypoints)) {
+    errors.push(`$.keypoints expected array got ${jsonTypeName(value.keypoints)}`);
+  }
+  if (
+    "citations" in value &&
+    (value.citations === null ||
+      typeof value.citations !== "object" ||
+      Array.isArray(value.citations))
+  ) {
+    errors.push(`$.citations expected object got ${jsonTypeName(value.citations)}`);
+  }
+  if (
+    "userTags" in value &&
+    (value.userTags === null ||
+      typeof value.userTags !== "object" ||
+      Array.isArray(value.userTags))
+  ) {
+    errors.push(`$.userTags expected object got ${jsonTypeName(value.userTags)}`);
+  }
+
+  return errors;
+}
+
 function interestingError(status, text) {
   if (status < 400) return false;
   return [
@@ -368,6 +468,12 @@ async function runAttempt(attempt, args, baseBody, schemas) {
   const { status, headers, text } = result;
   const responseJson = parseJsonOrNull(text);
   const details = responseJson ? malformedToolCallDetails(responseJson, schemas) : [];
+  const invalidJsonOutputs = (
+    responseJson && args.validateAssistantJson
+      ? invalidAssistantJsonOutputDetails(responseJson)
+      : []
+  );
+  const invalidResponseJson = status < 400 && responseJson === null;
   const errorIsInteresting = interestingError(status, text);
   const capture = {
     attempt,
@@ -378,14 +484,31 @@ async function runAttempt(attempt, args, baseBody, schemas) {
     response_body: text,
     response_json: responseJson,
     malformed_tool_calls: details,
+    invalid_json_outputs: invalidJsonOutputs,
+    invalid_response_json: invalidResponseJson,
     interesting_error: errorIsInteresting,
   };
+
+  if (invalidResponseJson) {
+    const filePath = writeCapture(args.outDir, attempt, "invalid-response-json", capture);
+    console.log(`  [${attempt}] INVALID response JSON captured: ${filePath}`);
+    return { attempt, exitCode: 5, captured: true };
+  }
 
   if (details.length > 0) {
     const filePath = writeCapture(args.outDir, attempt, "malformed-tool-call", capture);
     console.log(`  [${attempt}] MALFORMED tool call captured: ${filePath}`);
     for (const detail of details) console.log(`  [${attempt}] - ${detail.reason}`);
     return { attempt, exitCode: 2, captured: true };
+  }
+
+  if (invalidJsonOutputs.length > 0) {
+    const filePath = writeCapture(args.outDir, attempt, "invalid-json-output", capture);
+    console.log(`  [${attempt}] INVALID assistant JSON output captured: ${filePath}`);
+    for (const detail of invalidJsonOutputs) {
+      console.log(`  [${attempt}] - ${detail.reason}`);
+    }
+    return { attempt, exitCode: 5, captured: true };
   }
 
   if (errorIsInteresting) {
