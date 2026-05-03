@@ -18,6 +18,7 @@ function parseArgs(argv) {
     bodyFile: "kimi-malformed-request.json",
     url: process.env.LITELLM_URL || DEFAULT_URL,
     runs: 1,
+    concurrency: 1,
     delayMs: 0,
     timeoutMs: 180_000,
     outDir: "kimi-malformed-repro-output",
@@ -44,6 +45,7 @@ function parseArgs(argv) {
     if (arg === "--body-file") args.bodyFile = next();
     else if (arg === "--url") args.url = next();
     else if (arg === "--runs") args.runs = Number(next());
+    else if (arg === "--concurrency") args.concurrency = Number(next());
     else if (arg === "--delay-ms") args.delayMs = Number(next());
     else if (arg === "--delay-s") args.delayMs = Number(next()) * 1000;
     else if (arg === "--timeout-ms") args.timeoutMs = Number(next());
@@ -71,6 +73,11 @@ function parseArgs(argv) {
   if (!Number.isFinite(args.runs) || args.runs < 1) {
     throw new Error("--runs must be a positive number");
   }
+  if (!Number.isFinite(args.concurrency) || args.concurrency < 1) {
+    throw new Error("--concurrency must be a positive number");
+  }
+  args.runs = Math.floor(args.runs);
+  args.concurrency = Math.min(Math.floor(args.concurrency), args.runs);
   return args;
 }
 
@@ -87,6 +94,7 @@ Auth env, first present wins:
 Options:
   --url URL                         Default: ${DEFAULT_URL}
   --runs N                          Default: 1
+  --concurrency N                   Default: 1
   --out-dir DIR                     Default: kimi-malformed-repro-output
   --model MODEL                     Override request body model
   --request-id-prefix PREFIX        Default: kimi-malformed-repro
@@ -94,7 +102,7 @@ Options:
   --max-tokens N                    Inject max_tokens
   --max-completion-tokens N         Inject max_completion_tokens
   --timeout-s N                     Default: 180
-  --delay-s N                       Sleep between attempts
+  --delay-s N                       Sleep between attempts per worker
   --save-all                        Save every response
   --no-stop-on-malformed            Continue after malformed/error capture
   --keep-stream                     Do not force stream=false
@@ -332,6 +340,49 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function runAttempt(attempt, args, baseBody, schemas) {
+  const body = prepareBody(baseBody, args, attempt);
+  console.log(`[${attempt}/${args.runs}] request_id=${body.request_id ?? ""}`);
+
+  const { status, headers, text } = await postJson(args.url, body, args.timeoutMs);
+  const responseJson = parseJsonOrNull(text);
+  const details = responseJson ? malformedToolCallDetails(responseJson, schemas) : [];
+  const errorIsInteresting = interestingError(status, text);
+  const capture = {
+    attempt,
+    status,
+    request_id: body.request_id,
+    request: body,
+    response_headers: headers,
+    response_body: text,
+    response_json: responseJson,
+    malformed_tool_calls: details,
+    interesting_error: errorIsInteresting,
+  };
+
+  if (details.length > 0) {
+    const filePath = writeCapture(args.outDir, attempt, "malformed-tool-call", capture);
+    console.log(`  [${attempt}] MALFORMED tool call captured: ${filePath}`);
+    for (const detail of details) console.log(`  [${attempt}] - ${detail.reason}`);
+    return { attempt, exitCode: 2, captured: true };
+  }
+
+  if (errorIsInteresting) {
+    const filePath = writeCapture(args.outDir, attempt, "interesting-error", capture);
+    console.log(`  [${attempt}] INTERESTING error captured: status=${status} ${filePath}`);
+    return { attempt, exitCode: 3, captured: true };
+  }
+
+  if (args.saveAll) {
+    const filePath = writeCapture(args.outDir, attempt, "response", capture);
+    console.log(`  [${attempt}] saved: status=${status} ${filePath}`);
+  } else {
+    console.log(`  [${attempt}] ok: status=${status}`);
+  }
+
+  return { attempt, exitCode: 0, captured: false };
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const baseBody = readBody(args.bodyFile);
@@ -345,45 +396,40 @@ async function main() {
   console.log(`url=${args.url}`);
   console.log(`body_file=${args.bodyFile}`);
   console.log(`runs=${args.runs}`);
+  console.log(`concurrency=${args.concurrency}`);
   console.log(`out_dir=${args.outDir}`);
 
-  for (let attempt = 1; attempt <= args.runs; attempt++) {
-    const body = prepareBody(baseBody, args, attempt);
-    console.log(`[${attempt}/${args.runs}] request_id=${body.request_id ?? ""}`);
+  let nextAttempt = 1;
+  let stopScheduling = false;
+  let finalExitCode = 0;
 
-    const { status, headers, text } = await postJson(args.url, body, args.timeoutMs);
-    const responseJson = parseJsonOrNull(text);
-    const details = responseJson ? malformedToolCallDetails(responseJson, schemas) : [];
-    const errorIsInteresting = interestingError(status, text);
-    const capture = {
-      attempt,
-      status,
-      request_id: body.request_id,
-      request: body,
-      response_headers: headers,
-      response_body: text,
-      response_json: responseJson,
-      malformed_tool_calls: details,
-      interesting_error: errorIsInteresting,
-    };
+  async function worker() {
+    while (!stopScheduling) {
+      const attempt = nextAttempt++;
+      if (attempt > args.runs) return;
 
-    if (details.length > 0) {
-      const filePath = writeCapture(args.outDir, attempt, "malformed-tool-call", capture);
-      console.log(`  MALFORMED tool call captured: ${filePath}`);
-      for (const detail of details) console.log(`  - ${detail.reason}`);
-      if (args.stopOnMalformed) process.exit(2);
-    } else if (errorIsInteresting) {
-      const filePath = writeCapture(args.outDir, attempt, "interesting-error", capture);
-      console.log(`  INTERESTING error captured: status=${status} ${filePath}`);
-      if (args.stopOnMalformed) process.exit(3);
-    } else if (args.saveAll) {
-      const filePath = writeCapture(args.outDir, attempt, "response", capture);
-      console.log(`  saved: status=${status} ${filePath}`);
-    } else {
-      console.log(`  ok: status=${status}`);
+      const result = await runAttempt(attempt, args, baseBody, schemas);
+      if (result.exitCode !== 0 && finalExitCode === 0) {
+        finalExitCode = result.exitCode;
+      }
+      if (result.captured && args.stopOnMalformed) {
+        stopScheduling = true;
+      }
+
+      if (args.delayMs > 0 && !stopScheduling && nextAttempt <= args.runs) {
+        await sleep(args.delayMs);
+      }
     }
+  }
 
-    if (args.delayMs > 0 && attempt !== args.runs) await sleep(args.delayMs);
+  const workers = Array.from(
+    { length: args.concurrency },
+    () => worker(),
+  );
+  await Promise.all(workers);
+
+  if (finalExitCode !== 0) {
+    process.exit(finalExitCode);
   }
 
   console.log("finished without malformed tool calls or interesting errors");
