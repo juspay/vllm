@@ -251,6 +251,185 @@ class OpenAIServingChat(OpenAIServing):
         self.supports_code_interpreter = False
         self.python_tool = None
 
+    @staticmethod
+    def _json_type_name(value: Any) -> str:
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        if value is None:
+            return "null"
+        return type(value).__name__
+
+    @classmethod
+    def _matches_json_type(cls, value: Any, expected: str) -> bool:
+        if expected == "boolean":
+            return isinstance(value, bool)
+        if expected == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if expected == "string":
+            return isinstance(value, str)
+        if expected == "array":
+            return isinstance(value, list)
+        if expected == "object":
+            return isinstance(value, dict)
+        if expected == "null":
+            return value is None
+        return True
+
+    @classmethod
+    def _validate_schema_subset(
+        cls,
+        value: Any,
+        schema: dict[str, Any],
+        path: str = "$",
+    ) -> list[str]:
+        errors: list[str] = []
+
+        expected_type = schema.get("type")
+        expected_types = expected_type if isinstance(expected_type, list) else [
+            expected_type
+        ]
+        expected_types = [t for t in expected_types if isinstance(t, str)]
+        if expected_types and not any(
+            cls._matches_json_type(value, expected) for expected in expected_types
+        ):
+            errors.append(
+                f"{path} expected {'/'.join(expected_types)} got "
+                f"{cls._json_type_name(value)}"
+            )
+            return errors
+
+        enum_values = schema.get("enum")
+        if isinstance(enum_values, list) and value not in enum_values:
+            errors.append(f"{path} value {value!r} not in enum")
+
+        if not isinstance(value, dict):
+            return errors
+
+        required = schema.get("required")
+        if isinstance(required, list):
+            for key in required:
+                if isinstance(key, str) and key not in value:
+                    errors.append(f"{path}.{key} is required but missing")
+
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for key, subschema in properties.items():
+                if key not in value or not isinstance(subschema, dict):
+                    continue
+                errors.extend(
+                    cls._validate_schema_subset(value[key], subschema, f"{path}.{key}")
+                )
+
+        return errors
+
+    @staticmethod
+    def _tool_schemas_by_name(
+        request: ChatCompletionRequest,
+    ) -> dict[str, dict[str, Any]]:
+        schemas: dict[str, dict[str, Any]] = {}
+        for tool in request.tools or []:
+            function = getattr(tool, "function", None)
+            if function is None and isinstance(tool, dict):
+                function = tool.get("function")
+
+            name = getattr(function, "name", None)
+            if name is None and isinstance(function, dict):
+                name = function.get("name")
+            if not isinstance(name, str):
+                continue
+
+            parameters = getattr(function, "parameters", None)
+            if parameters is None and isinstance(function, dict):
+                parameters = function.get("parameters")
+            schemas[name] = parameters if isinstance(parameters, dict) else {}
+        return schemas
+
+    @staticmethod
+    def _model_dump_json_for_log(value: Any) -> str:
+        try:
+            return value.model_dump_json(exclude_none=True)
+        except Exception:
+            return json.dumps(value, ensure_ascii=False, default=str)
+
+    @classmethod
+    def _get_malformed_tool_call_details(
+        cls,
+        request: ChatCompletionRequest,
+        response: ChatCompletionResponse,
+    ) -> list[dict[str, Any]]:
+        schemas = cls._tool_schemas_by_name(request)
+        details: list[dict[str, Any]] = []
+
+        for choice in response.choices:
+            for tool_call in choice.message.tool_calls:
+                function_call = tool_call.function
+                reason = None
+                parsed_args = None
+
+                try:
+                    parsed_args = json.loads(function_call.arguments)
+                except json.JSONDecodeError as e:
+                    reason = f"invalid JSON arguments: {e}"
+
+                schema = schemas.get(function_call.name)
+                if reason is None and schema is None:
+                    reason = "unknown tool name"
+
+                if reason is None and schema is not None:
+                    schema_errors = cls._validate_schema_subset(parsed_args, schema)
+                    if schema_errors:
+                        reason = "schema mismatch: " + "; ".join(schema_errors)
+
+                if reason is not None:
+                    details.append({
+                        "choice_index": choice.index,
+                        "tool_call_id": tool_call.id,
+                        "tool_name": function_call.name,
+                        "arguments": function_call.arguments,
+                        "reason": reason,
+                    })
+
+        return details
+
+    def _log_malformed_tool_call_response(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        response: ChatCompletionResponse,
+        final_res: RequestOutput,
+    ) -> None:
+        malformed_details = self._get_malformed_tool_call_details(request, response)
+        if not malformed_details:
+            return
+
+        raw_outputs = {
+            output.index: output.text
+            for output in final_res.outputs
+        }
+        logger.error(
+            "Malformed Kimi K2 chat completion response: request_id=%s, "
+            "response_id=%s, malformed_tool_calls=%s, request=%s, "
+            "final_response=%s, raw_model_outputs=%s",
+            request.request_id,
+            response.id,
+            json.dumps(malformed_details, ensure_ascii=False),
+            self._model_dump_json_for_log(request),
+            self._model_dump_json_for_log(response),
+            json.dumps(raw_outputs, ensure_ascii=False),
+        )
+
     def warmup(self) -> None:
         self.renderer.warmup(
             ChatParams(
@@ -2033,6 +2212,12 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
+        )
+
+        self._log_malformed_tool_call_response(
+            request=request,
+            response=response,
+            final_res=final_res,
         )
 
         # Log complete response if output logging is enabled

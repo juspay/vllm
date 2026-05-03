@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # code modified from deepseekv3_tool_parser.py
 
+import json
 from collections.abc import Sequence
+from typing import Any
 
 import regex as re
 
@@ -149,6 +151,175 @@ class KimiK2ToolParser(ToolParser):
 
         logger.debug("Streaming state reset")
 
+    def _get_tool_schema(self, function_name: str) -> dict[str, Any] | None:
+        for tool in self.tools or []:
+            function = getattr(tool, "function", None)
+            if function is None and isinstance(tool, dict):
+                function = tool.get("function")
+
+            name = getattr(function, "name", None)
+            if name is None and isinstance(function, dict):
+                name = function.get("name")
+
+            if name != function_name:
+                continue
+
+            parameters = getattr(function, "parameters", None)
+            if parameters is None and isinstance(function, dict):
+                parameters = function.get("parameters")
+            return parameters if isinstance(parameters, dict) else {}
+        return None
+
+    @staticmethod
+    def _json_type_name(value: Any) -> str:
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        if value is None:
+            return "null"
+        return type(value).__name__
+
+    @classmethod
+    def _matches_json_type(cls, value: Any, expected: str) -> bool:
+        if expected == "boolean":
+            return isinstance(value, bool)
+        if expected == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if expected == "string":
+            return isinstance(value, str)
+        if expected == "array":
+            return isinstance(value, list)
+        if expected == "object":
+            return isinstance(value, dict)
+        if expected == "null":
+            return value is None
+        return True
+
+    @classmethod
+    def _validate_schema_subset(
+        cls,
+        value: Any,
+        schema: dict[str, Any],
+        path: str = "$",
+    ) -> list[str]:
+        errors: list[str] = []
+
+        expected_type = schema.get("type")
+        expected_types = expected_type if isinstance(expected_type, list) else [
+            expected_type
+        ]
+        expected_types = [t for t in expected_types if isinstance(t, str)]
+        if expected_types and not any(
+            cls._matches_json_type(value, expected) for expected in expected_types
+        ):
+            errors.append(
+                f"{path} expected {'/'.join(expected_types)} got "
+                f"{cls._json_type_name(value)}"
+            )
+            return errors
+
+        enum_values = schema.get("enum")
+        if isinstance(enum_values, list) and value not in enum_values:
+            errors.append(f"{path} value {value!r} not in enum")
+
+        if not isinstance(value, dict):
+            return errors
+
+        required = schema.get("required")
+        if isinstance(required, list):
+            for key in required:
+                if isinstance(key, str) and key not in value:
+                    errors.append(f"{path}.{key} is required but missing")
+
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for key, subschema in properties.items():
+                if key not in value or not isinstance(subschema, dict):
+                    continue
+                errors.extend(
+                    cls._validate_schema_subset(value[key], subschema, f"{path}.{key}")
+                )
+
+        return errors
+
+    def _log_malformed_tool_call(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        function_id: str | None,
+        function_name: str | None,
+        function_args: str | None,
+        model_output: str,
+        reason: str,
+    ) -> None:
+        logger.error(
+            "Malformed Kimi K2 tool call generated: request_id=%s, "
+            "tool_call_id=%r, tool_name=%r, reason=%s, arguments=%r, "
+            "raw_model_output=%r",
+            request.request_id,
+            function_id,
+            function_name,
+            reason,
+            function_args,
+            model_output,
+        )
+
+    def _log_if_malformed_tool_call(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        function_id: str,
+        function_name: str,
+        function_args: str,
+        model_output: str,
+    ) -> None:
+        try:
+            parsed_args = json.loads(function_args)
+        except json.JSONDecodeError as e:
+            self._log_malformed_tool_call(
+                request=request,
+                function_id=function_id,
+                function_name=function_name,
+                function_args=function_args,
+                model_output=model_output,
+                reason=f"invalid JSON arguments: {e}",
+            )
+            return
+
+        schema = self._get_tool_schema(function_name)
+        if schema is None:
+            self._log_malformed_tool_call(
+                request=request,
+                function_id=function_id,
+                function_name=function_name,
+                function_args=function_args,
+                model_output=model_output,
+                reason="unknown tool name",
+            )
+            return
+
+        schema_errors = self._validate_schema_subset(parsed_args, schema)
+        if schema_errors:
+            self._log_malformed_tool_call(
+                request=request,
+                function_id=function_id,
+                function_name=function_name,
+                function_args=function_args,
+                model_output=model_output,
+                reason="schema mismatch: " + "; ".join(schema_errors),
+            )
+
     def extract_tool_calls(
         self,
         model_output: str,
@@ -169,12 +340,29 @@ class KimiK2ToolParser(ToolParser):
                 function_call_tuples = self.tool_call_regex.findall(model_output)
 
                 logger.debug("function_call_tuples: %s", function_call_tuples)
+                if not function_call_tuples:
+                    self._log_malformed_tool_call(
+                        request=request,
+                        function_id=None,
+                        function_name=None,
+                        function_args=None,
+                        model_output=model_output,
+                        reason="tool call section present but no complete "
+                        "tool call matched Kimi parser format",
+                    )
 
                 tool_calls = []
                 for match in function_call_tuples:
                     function_id, function_args = match
                     # function_id: functions.get_weather:0 or get_weather:0
                     function_name = function_id.split(":")[0].split(".")[-1]
+                    self._log_if_malformed_tool_call(
+                        request=request,
+                        function_id=function_id,
+                        function_name=function_name,
+                        function_args=function_args,
+                        model_output=model_output,
+                    )
                     tool_calls.append(
                         ToolCall(
                             id=function_id,
