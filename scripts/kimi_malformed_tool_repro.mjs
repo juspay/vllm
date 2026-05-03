@@ -344,7 +344,28 @@ async function runAttempt(attempt, args, baseBody, schemas) {
   const body = prepareBody(baseBody, args, attempt);
   console.log(`[${attempt}/${args.runs}] request_id=${body.request_id ?? ""}`);
 
-  const { status, headers, text } = await postJson(args.url, body, args.timeoutMs);
+  let result;
+  try {
+    result = await postJson(args.url, body, args.timeoutMs);
+  } catch (error) {
+    const capture = {
+      attempt,
+      request_id: body.request_id,
+      request: body,
+      error_name: error?.name,
+      error_message: error?.message,
+      error_stack: error?.stack,
+      timeout_ms: args.timeoutMs,
+    };
+    const filePath = writeCapture(args.outDir, attempt, "request-error", capture);
+    console.log(
+      `  [${attempt}] REQUEST error captured: ${error?.name || "Error"} `
+      + `${error?.message || error} ${filePath}`,
+    );
+    return { attempt, exitCode: 4, captured: true };
+  }
+
+  const { status, headers, text } = result;
   const responseJson = parseJsonOrNull(text);
   const details = responseJson ? malformedToolCallDetails(responseJson, schemas) : [];
   const errorIsInteresting = interestingError(status, text);
