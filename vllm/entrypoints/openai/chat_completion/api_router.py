@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
+
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -27,19 +27,6 @@ logger = init_logger(__name__)
 
 router = APIRouter()
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
-LOG_ALL_CHAT_COMPLETION_400_ERRORS = "VLLM_LOG_ALL_CHAT_COMPLETION_400_ERRORS"
-CHAT_COMPLETION_400_LOG_KEYWORDS = (
-    "expecting value",
-    "expecting property name",
-    "extra data",
-    "invalid control character",
-    "invalid \\escape",
-    "jsondecodeerror",
-    "line 1 column",
-    "malformed",
-    "tool call",
-    "unterminated string",
-)
 
 
 def chat(request: Request) -> OpenAIServingChat | None:
@@ -55,26 +42,9 @@ def _get_request_id(raw_request: Request) -> str | None:
     return getattr(request_metadata, "request_id", None)
 
 
-def _should_log_chat_completion_400_details(error: ErrorResponse) -> bool:
-    if os.environ.get(LOG_ALL_CHAT_COMPLETION_400_ERRORS, "").lower() in (
-        "1",
-        "true",
-        "yes",
-    ):
-        return True
-
-    error_text = str(error.model_dump()).lower()
-    return any(
-        keyword in error_text for keyword in CHAT_COMPLETION_400_LOG_KEYWORDS
-    )
-
-
 def _log_chat_error_response(
     request: ChatCompletionRequest, raw_request: Request, error: ErrorResponse
 ) -> None:
-    if not _should_log_chat_completion_400_details(error):
-        return
-
     try:
         logger.error(
             "Chat completion ErrorResponse returned: request_id=%s, "
