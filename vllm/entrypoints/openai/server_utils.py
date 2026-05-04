@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import secrets
 import uuid
 from argparse import Namespace
@@ -33,6 +34,33 @@ from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 logger = init_logger("vllm.entrypoints.openai.server_utils")
+LOG_ALL_CHAT_COMPLETION_400_ERRORS = "VLLM_LOG_ALL_CHAT_COMPLETION_400_ERRORS"
+CHAT_COMPLETION_400_LOG_KEYWORDS = (
+    "expecting value",
+    "expecting property name",
+    "extra data",
+    "invalid control character",
+    "invalid \\escape",
+    "jsondecodeerror",
+    "line 1 column",
+    "malformed",
+    "tool call",
+    "unterminated string",
+)
+
+
+def _should_log_chat_completion_400_details(error: ErrorResponse) -> bool:
+    if os.environ.get(LOG_ALL_CHAT_COMPLETION_400_ERRORS, "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return True
+
+    error_text = str(error.model_dump()).lower()
+    return any(
+        keyword in error_text for keyword in CHAT_COMPLETION_400_LOG_KEYWORDS
+    )
 
 
 class AuthenticationMiddleware:
@@ -434,7 +462,10 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
             param=param,
         )
     )
-    if req.url.path.endswith("/chat/completions"):
+    if (
+        req.url.path.endswith("/chat/completions")
+        and _should_log_chat_completion_400_details(err)
+    ):
         try:
             logger.error(
                 "Chat completion RequestValidationError returned: request_id=%s, "
