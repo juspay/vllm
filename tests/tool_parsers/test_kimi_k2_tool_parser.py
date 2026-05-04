@@ -8,7 +8,11 @@ import pytest
 
 from vllm.entrypoints.openai.engine.protocol import FunctionCall, ToolCall
 from vllm.tokenizers import get_tokenizer
-from vllm.tool_parsers.kimi_k2_tool_parser import KimiK2ToolParser
+from vllm.tool_parsers.kimi_k2_tool_parser import (
+    KimiK2ToolParser,
+    _structural_diff,
+    _validate_or_repair_args,
+)
 
 # Use a common model that is likely to be available
 MODEL = "moonshotai/Kimi-K2-Instruct"
@@ -277,7 +281,8 @@ def test_extract_tool_calls(
 
 
 def test_extract_tool_calls_invalid_json(kimi_k2_tool_parser):
-    """we'll return every funcall result"""
+    """Malformed JSON args should be repaired (json-repair) before being
+    emitted, so the client always receives parseable JSON."""
     model_output = """I'll help you check the weather. <|tool_calls_section_begin|> <|tool_call_begin|>
 functions.invalid_get_weather:0 <|tool_call_argument_begin|> {"city": "Beijing" <|tool_call_end|> <|tool_call_begin|>
 functions.valid_get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool_call_end|> <|tool_calls_section_end|>"""
@@ -287,10 +292,287 @@ functions.valid_get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} 
     )  # type: ignore[arg-type]
 
     assert extracted_tool_calls.tools_called
-    # Should extract only the valid JSON tool calls
     assert len(extracted_tool_calls.tool_calls) == 2
     assert extracted_tool_calls.tool_calls[0].function.name == "invalid_get_weather"
     assert extracted_tool_calls.tool_calls[1].function.name == "valid_get_weather"
+    # Both args strings must now parse as valid JSON.
+    args0 = json.loads(extracted_tool_calls.tool_calls[0].function.arguments)
+    args1 = json.loads(extracted_tool_calls.tool_calls[1].function.arguments)
+    assert args0 == {"city": "Beijing"}
+    assert args1 == {"city": "Shanghai"}
+
+
+def test_extract_tool_calls_repair_production_sample(kimi_k2_tool_parser):
+    """Regression: production failure where Kimi K2.6 emitted args missing
+    the final closing brace. json-repair should recover them."""
+    # Args from production: outer object missing the final `}`.
+    bad_args = (
+        '{"input": "{\\"request_id\\": \\"f9faaf55-6a62-4445-8fb5-e088c33f09f9\\", '
+        '\\"order_id\\": \\"TEJFEF84815\\", \\"merchant_id\\": \\"hungerbox\\", '
+        '\\"query\\": \\"Investigate decideGatewayHS function that threw '
+        'DECIDE_GATEWAY_HS_FAILED error.\\"}"'
+    )
+    model_output = (
+        "<|tool_calls_section_begin|> <|tool_call_begin|> "
+        f"functions.analyze_code:14 <|tool_call_argument_begin|> {bad_args} "
+        "<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+    # Sanity: confirm the input is genuinely malformed.
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(bad_args)
+
+    extracted = kimi_k2_tool_parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
+    assert extracted.tools_called
+    assert len(extracted.tool_calls) == 1
+    assert extracted.tool_calls[0].function.name == "analyze_code"
+    # Repaired args parse cleanly and preserve the inner payload.
+    parsed = json.loads(extracted.tool_calls[0].function.arguments)
+    assert "input" in parsed
+    assert "request_id" in parsed["input"]
+
+
+def test_validate_or_repair_args_strict_passthrough():
+    """Already-valid JSON should pass through unchanged with was_repaired=False."""
+    src = '{"a": 1, "b": "hello"}'
+    out, was_repaired = _validate_or_repair_args(src, "fn")
+    assert out == src
+    assert was_repaired is False
+
+
+def test_validate_or_repair_args_missing_close_brace():
+    src = '{"city": "Beijing"'
+    out, was_repaired = _validate_or_repair_args(src, "get_weather")
+    assert out is not None
+    assert was_repaired is True
+    assert json.loads(out) == {"city": "Beijing"}
+
+
+def test_validate_or_repair_args_invalid_escape():
+    """Haskell-style `\\_` escape should be repaired."""
+    src = '{"code": "let x = 1\\_2"}'
+    out, was_repaired = _validate_or_repair_args(src, "run")
+    assert out is not None
+    assert was_repaired is True
+    json.loads(out)  # must parse
+
+
+def test_validate_or_repair_args_trailing_junk():
+    src = '{"a": 1} unexpected trailing stuff'
+    out, was_repaired = _validate_or_repair_args(src, "fn")
+    assert out is not None
+    assert was_repaired is True
+    assert json.loads(out) == {"a": 1}
+
+
+def test_structural_diff_no_change():
+    """Repair that just closes a brace should not show dropped/added keys."""
+    diff = _structural_diff('{"a": 1, "b": 2', '{"a": 1, "b": 2}')
+    assert "keys_dropped=[]" in diff
+    assert "keys_added=[]" in diff
+
+
+def test_structural_diff_dropped_field():
+    """Repair that drops a field should be visible in the diff log."""
+    # `{"a":1,"b":}` → `{"a":1}` - json_repair commonly drops broken values.
+    diff = _structural_diff('{"a": 1, "b":', '{"a": 1}')
+    assert "keys_dropped=['b']" in diff
+
+
+def test_validate_or_repair_args_unrecoverable():
+    """Pure garbage with no recoverable JSON returns None."""
+    out, was_repaired = _validate_or_repair_args("@@@ not json at all @@@", "fn")
+    assert was_repaired is True
+    # json-repair is permissive and may produce an empty container; either
+    # None or empty-but-parseable is acceptable - the contract is that the
+    # returned string is parseable or None.
+    if out is not None:
+        json.loads(out)
+
+
+def test_log_malformed_tool_call_tolerates_request_none(kimi_k2_tool_parser):
+    """Regression: _log_malformed_tool_call must not crash on request=None.
+
+    The new repair-then-validate flow can be exercised with request=None
+    (e.g. unit tests, or any caller that doesn't pass through a request
+    object). Earlier versions accessed `request.request_id` directly,
+    raising AttributeError.
+    """
+    # Should not raise.
+    kimi_k2_tool_parser._log_malformed_tool_call(
+        request=None,
+        function_id="functions.foo:0",
+        function_name="foo",
+        function_args='{"a":1}',
+        model_output="<irrelevant>",
+        reason="test",
+    )
+
+
+def test_repaired_call_with_schema_mismatch_raises(kimi_k2_tokenizer):
+    """When repair succeeds but the repaired args fail schema validation
+    (e.g. json-repair silently dropped a required field), the parser must
+    raise MalformedToolCallError so serving.py converts to a 500 and
+    LiteLLM retries."""
+    from vllm.entrypoints.openai.chat_completion.serving import (
+        MalformedToolCallError,
+    )
+
+    # Construct a parser with a tool whose schema requires `city`.
+    class _Fn:
+        def __init__(self, name, parameters):
+            self.name = name
+            self.parameters = parameters
+
+    class _Tool:
+        def __init__(self, function):
+            self.function = function
+
+    tools = [
+        _Tool(
+            _Fn(
+                "get_weather",
+                {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            )
+        )
+    ]
+    parser = KimiK2ToolParser(kimi_k2_tokenizer, tools=tools)
+    # Args missing the required `city` field, plus malformed (missing `}`).
+    # json-repair turns `{"foo": "bar"` into `{"foo": "bar"}` - parseable
+    # but `city` (required) is missing.
+    model_output = (
+        "<|tool_calls_section_begin|> <|tool_call_begin|> "
+        'functions.get_weather:0 <|tool_call_argument_begin|> {"foo": "bar" '
+        "<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+    with pytest.raises(MalformedToolCallError, match="post-repair"):
+        parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
+
+
+def test_repaired_call_passing_schema_is_emitted(kimi_k2_tokenizer):
+    """When repair succeeds and the repaired args satisfy the schema, the
+    call is emitted as normal."""
+
+    class _Fn:
+        def __init__(self, name, parameters):
+            self.name = name
+            self.parameters = parameters
+
+    class _Tool:
+        def __init__(self, function):
+            self.function = function
+
+    tools = [
+        _Tool(
+            _Fn(
+                "get_weather",
+                {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            )
+        )
+    ]
+    parser = KimiK2ToolParser(kimi_k2_tokenizer, tools=tools)
+    # Args missing closing `}` only - repair restores it; schema is fine.
+    model_output = (
+        "<|tool_calls_section_begin|> <|tool_call_begin|> "
+        'functions.get_weather:0 <|tool_call_argument_begin|> {"city": "Beijing" '
+        "<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+    extracted = parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
+    assert len(extracted.tool_calls) == 1
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "Beijing"}
+
+
+def test_extract_tool_calls_unrecoverable_json_raises(kimi_k2_tokenizer):
+    """When repair fails entirely, the parser must raise so LiteLLM retries.
+
+    This requires we feed args that json-repair cannot recover. json-repair
+    is permissive, so we use a parser fixture without the json-repair
+    package; if it's installed we cannot reliably trigger this case in a
+    unit test - the behavior is verified at the helper level by
+    test_validate_or_repair_args_unrecoverable.
+    """
+    # The contract is: when _validate_or_repair_args returns (None, _),
+    # extract_tool_calls raises MalformedToolCallError. Verify the
+    # contract by patching the helper.
+    from vllm.entrypoints.openai.chat_completion.serving import (
+        MalformedToolCallError,
+    )
+    from vllm.tool_parsers import kimi_k2_tool_parser as kk2
+
+    parser = KimiK2ToolParser(kimi_k2_tokenizer)
+    model_output = (
+        "<|tool_calls_section_begin|> <|tool_call_begin|> "
+        'functions.run:0 <|tool_call_argument_begin|> {"a": 1} '
+        "<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+    real = kk2._validate_or_repair_args
+    try:
+        kk2._validate_or_repair_args = lambda *a, **kw: (None, True)  # type: ignore[assignment]
+        with pytest.raises(MalformedToolCallError, match="unrecoverable"):
+            parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
+    finally:
+        kk2._validate_or_repair_args = real  # type: ignore[assignment]
+
+
+def test_streaming_repair_at_finalization(kimi_k2_tool_parser):
+    """Streaming: malformed args (missing closing brace) are repaired at the
+    close-of-tool-call boundary so the cumulative args the client sees parse
+    as valid JSON."""
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    # Single-shot delta containing the whole tool call with malformed args.
+    # The args `{"city": "Beijing"` is missing the trailing `}`. Since the
+    # close branch keys on `"}` in the trailing delta, we compose args that
+    # end in `"}` but with broken structure earlier - here, an unclosed
+    # outer object after a nested string close: `{"a": "b"}"}` would
+    # already parse, so use a simpler malformation: a known bad escape.
+    args = '{"code": "let x = 1\\_2"}'
+    full_call = (
+        f"<|tool_calls_section_begin|> <|tool_call_begin|> "
+        f"functions.run:0 <|tool_call_argument_begin|> {args} "
+        f"<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+    deltas = [(full_call, [])]
+    results = run_streaming_sequence(kimi_k2_tool_parser, deltas)
+
+    # Collect every args fragment emitted across all deltas.
+    emitted_args = ""
+    for r in results:
+        if r is None or not getattr(r, "tool_calls", None):
+            continue
+        for tc in r.tool_calls:
+            fn = getattr(tc, "function", None)
+            if fn is None:
+                continue
+            arg_chunk = fn.get("arguments") if isinstance(fn, dict) else fn.arguments
+            if arg_chunk:
+                emitted_args += arg_chunk
+
+    # Whatever the parser streamed must reassemble into valid JSON.
+    if emitted_args:
+        json.loads(emitted_args)
+
+
+def test_extract_tool_calls_repair_invalid_escape(kimi_k2_tool_parser):
+    """`\\_` (Haskell-style invalid JSON escape) should be repaired."""
+    model_output = (
+        "<|tool_calls_section_begin|> <|tool_call_begin|> "
+        'functions.run:0 <|tool_call_argument_begin|> {"code": "let x = 1\\_2"} '
+        "<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+    extracted = kimi_k2_tool_parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
+    assert extracted.tools_called
+    assert len(extracted.tool_calls) == 1
+    # Must parse as JSON after repair.
+    json.loads(extracted.tool_calls[0].function.arguments)
 
 
 def test_extract_tool_calls_invalid_funcall(kimi_k2_tool_parser):
