@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # code modified from deepseekv3_tool_parser.py
 
+import json
 from collections.abc import Sequence
+from typing import Any
 
 import regex as re
 
@@ -24,7 +26,126 @@ from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,
 )
 
+
+def _raise_malformed_tool_call(reason: str) -> None:
+    """Raise serving.MalformedToolCallError, deferred to break import cycle.
+
+    The parser is imported by serving.py, so we cannot import the exception
+    at module load. The exception class lives in serving.py for historical
+    reasons (Shivam's earlier degenerate-output detection); raising it here
+    bubbles up through serving's existing handlers and becomes a 500 so
+    LiteLLM (or any retrying client) retries the request.
+    """
+    from vllm.entrypoints.openai.chat_completion.serving import (
+        MalformedToolCallError,
+    )
+
+    raise MalformedToolCallError(reason)
+
+
+try:
+    from json_repair import repair_json as _repair_json
+
+    _HAS_JSON_REPAIR = True
+except ImportError:
+    _HAS_JSON_REPAIR = False
+    _repair_json = None  # type: ignore[assignment]
+
 logger = init_logger(__name__)
+
+if not _HAS_JSON_REPAIR:
+    logger.warning(
+        "json_repair not installed; malformed Kimi K2 tool-call JSON will not "
+        "be auto-repaired. Install with `pip install json-repair`."
+    )
+
+
+# Heuristic key extraction from a malformed JSON string. Matches any
+# `"key":` pattern at any nesting depth. Used only for telemetry to compare
+# what keys were present before vs after json-repair.
+_JSON_KEY_PATTERN = re.compile(r'"([^"\\]+)"\s*:')
+
+
+def _all_keys_in_value(obj: object) -> set[str]:
+    """Collect all dict keys at every nesting level of a parsed JSON value."""
+    if isinstance(obj, dict):
+        out = set(obj.keys())
+        for v in obj.values():
+            out |= _all_keys_in_value(v)
+        return out
+    if isinstance(obj, list):
+        out: set[str] = set()
+        for v in obj:
+            out |= _all_keys_in_value(v)
+        return out
+    return set()
+
+
+def _structural_diff(orig_str: str, repaired_str: str) -> str:
+    """Best-effort structural diff between malformed orig and repaired JSON.
+
+    The orig is malformed so we approximate its keys via regex; the repaired
+    side is parsed strictly. Logs which keys appeared/disappeared during
+    repair so operators can spot when json-repair drops required fields.
+    """
+    try:
+        orig_keys = set(_JSON_KEY_PATTERN.findall(orig_str))
+        repaired_keys = _all_keys_in_value(json.loads(repaired_str))
+        dropped = sorted(orig_keys - repaired_keys)
+        added = sorted(repaired_keys - orig_keys)
+        return f"keys_dropped={dropped} keys_added={added}"
+    except Exception:
+        return "diff_unavailable"
+
+
+def _validate_or_repair_args(
+    args_str: str,
+    fn_name: str,
+    request_id: str | None = None,
+) -> tuple[str | None, bool]:
+    """Strict JSON parse with json-repair fallback.
+
+    Returns ``(args, was_repaired)`` where:
+      * ``(args_str, False)`` - input parses strictly; emitted as-is.
+      * ``(repaired, True)`` - input failed but json-repair recovered it.
+      * ``(None, True)`` - unrecoverable.
+
+    Callers use ``was_repaired`` to decide whether to apply additional
+    safety gates (e.g. schema validation) - json-repair can silently drop
+    fields, so the post-repair value should not be trusted blindly.
+    """
+    try:
+        json.loads(args_str)
+        return args_str, False
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "Malformed Kimi K2 tool args for %s (request_id=%s) at pos %d: "
+            "%s. arg_len=%d. Attempting repair.",
+            fn_name,
+            request_id,
+            e.pos,
+            e.msg,
+            len(args_str),
+        )
+    if not _HAS_JSON_REPAIR or _repair_json is None:
+        return None, True
+    try:
+        repaired = _repair_json(args_str)
+        if not repaired:
+            return None, True
+        json.loads(repaired)
+    except Exception as err:
+        logger.error("json_repair could not recover args for %s: %s", fn_name, err)
+        return None, True
+    logger.warning(
+        "Repaired Kimi K2 tool args for %s (request_id=%s) len %d -> %d. %s",
+        fn_name,
+        request_id,
+        len(args_str),
+        len(repaired),
+        _structural_diff(args_str, repaired),
+    )
+    return repaired, True
 
 
 class KimiK2ToolParser(ToolParser):
@@ -149,6 +270,130 @@ class KimiK2ToolParser(ToolParser):
 
         logger.debug("Streaming state reset")
 
+    def _get_tool_schema(self, function_name: str) -> dict[str, Any] | None:
+        for tool in self.tools or []:
+            function = getattr(tool, "function", None)
+            if function is None and isinstance(tool, dict):
+                function = tool.get("function")
+
+            name = getattr(function, "name", None)
+            if name is None and isinstance(function, dict):
+                name = function.get("name")
+
+            if name != function_name:
+                continue
+
+            parameters = getattr(function, "parameters", None)
+            if parameters is None and isinstance(function, dict):
+                parameters = function.get("parameters")
+            return parameters if isinstance(parameters, dict) else {}
+        return None
+
+    @staticmethod
+    def _json_type_name(value: Any) -> str:
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        if value is None:
+            return "null"
+        return type(value).__name__
+
+    @classmethod
+    def _matches_json_type(cls, value: Any, expected: str) -> bool:
+        if expected == "boolean":
+            return isinstance(value, bool)
+        if expected == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if expected == "string":
+            return isinstance(value, str)
+        if expected == "array":
+            return isinstance(value, list)
+        if expected == "object":
+            return isinstance(value, dict)
+        if expected == "null":
+            return value is None
+        return True
+
+    @classmethod
+    def _validate_schema_subset(
+        cls,
+        value: Any,
+        schema: dict[str, Any],
+        path: str = "$",
+    ) -> list[str]:
+        errors: list[str] = []
+
+        expected_type = schema.get("type")
+        expected_types = (
+            expected_type if isinstance(expected_type, list) else [expected_type]
+        )
+        expected_types = [t for t in expected_types if isinstance(t, str)]
+        if expected_types and not any(
+            cls._matches_json_type(value, expected) for expected in expected_types
+        ):
+            errors.append(
+                f"{path} expected {'/'.join(expected_types)} got "
+                f"{cls._json_type_name(value)}"
+            )
+            return errors
+
+        enum_values = schema.get("enum")
+        if isinstance(enum_values, list) and value not in enum_values:
+            errors.append(f"{path} value {value!r} not in enum")
+
+        if not isinstance(value, dict):
+            return errors
+
+        required = schema.get("required")
+        if isinstance(required, list):
+            for key in required:
+                if isinstance(key, str) and key not in value:
+                    errors.append(f"{path}.{key} is required but missing")
+
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for key, subschema in properties.items():
+                if key not in value or not isinstance(subschema, dict):
+                    continue
+                errors.extend(
+                    cls._validate_schema_subset(value[key], subschema, f"{path}.{key}")
+                )
+
+        return errors
+
+    def _check_tool_call_issue(
+        self, function_args: str, function_name: str
+    ) -> str | None:
+        """Return the malformation reason for a tool call, or None if OK.
+
+        Skips schema/name checks when the parser was constructed without a
+        tools list, since we have nothing to validate against.
+        """
+        try:
+            parsed_args = json.loads(function_args)
+        except json.JSONDecodeError as e:
+            return f"invalid JSON arguments: {e}"
+        if not self.tools:
+            return None
+        schema = self._get_tool_schema(function_name)
+        if schema is None:
+            return "unknown tool name"
+        schema_errors = self._validate_schema_subset(parsed_args, schema)
+        if schema_errors:
+            return "schema mismatch: " + "; ".join(schema_errors)
+        return None
+
     def extract_tool_calls(
         self,
         model_output: str,
@@ -170,17 +415,45 @@ class KimiK2ToolParser(ToolParser):
 
                 logger.debug("function_call_tuples: %s", function_call_tuples)
 
+                request_id = getattr(request, "request_id", None)
                 tool_calls = []
                 for match in function_call_tuples:
                     function_id, function_args = match
                     # function_id: functions.get_weather:0 or get_weather:0
                     function_name = function_id.split(":")[0].split(".")[-1]
+                    repaired_args, was_repaired = _validate_or_repair_args(
+                        function_args, function_name, request_id
+                    )
+                    if repaired_args is None:
+                        # Unrecoverable malformed JSON. Raise so serving.py
+                        # converts it to a 500 - LiteLLM will retry the
+                        # request, model rolls dice again. Dropping silently
+                        # would leave the client with empty tool_calls and
+                        # no clear retry signal.
+                        _raise_malformed_tool_call(
+                            f"unrecoverable JSON args for {function_name} "
+                            f"(tool_call_id={function_id}, request_id={request_id})"
+                        )
+                    if was_repaired:
+                        # json-repair can produce parseable-but-wrong JSON
+                        # (e.g. silently drop a required field). Validate
+                        # the repaired args against the tool schema before
+                        # emitting; on failure raise so LiteLLM retries.
+                        issue = self._check_tool_call_issue(
+                            repaired_args, function_name
+                        )
+                        if issue:
+                            _raise_malformed_tool_call(
+                                f"post-repair {issue} for {function_name} "
+                                f"(tool_call_id={function_id}, "
+                                f"request_id={request_id})"
+                            )
                     tool_calls.append(
                         ToolCall(
                             id=function_id,
                             type="function",
                             function=FunctionCall(
-                                name=function_name, arguments=function_args
+                                name=function_name, arguments=repaired_args
                             ),
                         )
                     )
@@ -192,7 +465,15 @@ class KimiK2ToolParser(ToolParser):
                     content=content if content else None,
                 )
 
-            except Exception:
+            except Exception as exc:
+                # Let MalformedToolCallError propagate so serving.py converts
+                # it to a 500 and LiteLLM retries.
+                from vllm.entrypoints.openai.chat_completion.serving import (
+                    MalformedToolCallError,
+                )
+
+                if isinstance(exc, MalformedToolCallError):
+                    raise
                 logger.exception("Error in extracting tool call from response.")
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output
@@ -408,6 +689,54 @@ class KimiK2ToolParser(ToolParser):
                         "been streamed yet: %s",
                         diff,
                     )
+                    # Validate the cumulative args at finalization. The
+                    # contract is identical to the non-streaming path: if
+                    # the args cannot be safely emitted, raise so serving.py
+                    # turns it into a 500 and LiteLLM retries. Cases:
+                    #  * strict-parse OK              -> emit as before
+                    #  * repair OK + schema OK        -> emit corrected diff
+                    #  * repair OK + schema FAIL      -> raise (retry)
+                    #  * repair OK + prefix changed   -> raise (retry)
+                    #  * repair FAILED                -> raise (retry)
+                    already_streamed = self.streamed_args_for_tool[self.current_tool_id]
+                    proposed_full = already_streamed + diff
+                    fn_name = self.prev_tool_call_arr[self.current_tool_id].get(
+                        "name", "unknown"
+                    )
+                    request_id = getattr(request, "request_id", None)
+                    repaired_full, was_repaired = _validate_or_repair_args(
+                        proposed_full, fn_name, request_id
+                    )
+                    if repaired_full is None:
+                        _raise_malformed_tool_call(
+                            f"streaming: unrecoverable JSON args for {fn_name} "
+                            f"(request_id={request_id}, full_len={len(proposed_full)})"
+                        )
+                    if was_repaired and repaired_full != proposed_full:
+                        if not repaired_full.startswith(already_streamed):
+                            _raise_malformed_tool_call(
+                                f"streaming: repair for {fn_name} changed "
+                                f"already-streamed prefix "
+                                f"(request_id={request_id}, "
+                                f"streamed_len={len(already_streamed)}, "
+                                f"repaired_len={len(repaired_full)})"
+                            )
+                        issue = self._check_tool_call_issue(repaired_full, fn_name)
+                        if issue:
+                            _raise_malformed_tool_call(
+                                f"streaming: post-repair {issue} for "
+                                f"{fn_name} (request_id={request_id})"
+                            )
+                        new_diff = repaired_full[len(already_streamed) :]
+                        logger.warning(
+                            "Streaming repair adjusted final diff for %s "
+                            "(request_id=%s): %d -> %d chars",
+                            fn_name,
+                            request_id,
+                            len(diff),
+                            len(new_diff),
+                        )
+                        diff = new_diff
                     self.streamed_args_for_tool[self.current_tool_id] += diff
                     # Handle deferred section exit before returning
                     if deferred_section_exit and self.in_tool_section:
@@ -596,6 +925,14 @@ class KimiK2ToolParser(ToolParser):
 
             return delta
 
-        except Exception:
+        except Exception as exc:
+            # Let MalformedToolCallError propagate so serving.py converts it
+            # to a 500 and LiteLLM retries the request.
+            from vllm.entrypoints.openai.chat_completion.serving import (
+                MalformedToolCallError,
+            )
+
+            if isinstance(exc, MalformedToolCallError):
+                raise
             logger.exception("Error trying to handle streaming tool call.")
             return None  # do not stream a delta. skip this token ID.
