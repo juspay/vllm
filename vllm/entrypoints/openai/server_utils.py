@@ -434,6 +434,20 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
             param=param,
         )
     )
+    if req.url.path.endswith("/chat/completions"):
+        try:
+            logger.error(
+                "Chat completion RequestValidationError returned: request_id=%s, "
+                "status_code=%s, error=%s, body=%s",
+                req.state.request_metadata.request_id
+                if hasattr(req.state, "request_metadata")
+                else None,
+                HTTPStatus.BAD_REQUEST,
+                err.model_dump(),
+                (await req.body()).decode("utf-8", errors="replace"),
+            )
+        except Exception:
+            logger.exception("Failed to log chat completion validation error.")
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 

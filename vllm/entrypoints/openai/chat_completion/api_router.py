@@ -37,6 +37,27 @@ def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
     return request.app.state.openai_serving_chat_batch
 
 
+def _get_request_id(raw_request: Request) -> str | None:
+    request_metadata = getattr(raw_request.state, "request_metadata", None)
+    return getattr(request_metadata, "request_id", None)
+
+
+def _log_chat_error_response(
+    request: ChatCompletionRequest, raw_request: Request, error: ErrorResponse
+) -> None:
+    try:
+        logger.error(
+            "Chat completion ErrorResponse returned: request_id=%s, "
+            "status_code=%s, error=%s, request=%s",
+            _get_request_id(raw_request),
+            error.error.code,
+            error.model_dump(),
+            request.model_dump(),
+        )
+    except Exception:
+        logger.exception("Failed to log chat completion ErrorResponse.")
+
+
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(validate_json_request)],
@@ -61,6 +82,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
+        _log_chat_error_response(request, raw_request, generator)
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
