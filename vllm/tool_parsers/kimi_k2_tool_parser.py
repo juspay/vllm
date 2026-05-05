@@ -4,7 +4,7 @@
 
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, NoReturn
 
 import regex as re
 
@@ -27,14 +27,14 @@ from vllm.tool_parsers.abstract_tool_parser import (
 )
 
 
-def _raise_malformed_tool_call(reason: str) -> None:
+def _raise_malformed_tool_call(reason: str) -> NoReturn:
     """Raise serving.MalformedToolCallError, deferred to break import cycle.
 
-    The parser is imported by serving.py, so we cannot import the exception
-    at module load. The exception class lives in serving.py for historical
-    reasons (Shivam's earlier degenerate-output detection); raising it here
-    bubbles up through serving's existing handlers and becomes a 500 so
-    LiteLLM (or any retrying client) retries the request.
+    Annotated NoReturn so callers using
+    ``if x is None: _raise_malformed_tool_call(...)`` get correct type
+    narrowing on ``x`` afterwards. The parser is imported by serving.py,
+    so MalformedToolCallError must be imported lazily inside this function
+    rather than at module load.
     """
     from vllm.entrypoints.openai.chat_completion.serving import (
         MalformedToolCallError,

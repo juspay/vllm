@@ -1898,13 +1898,30 @@ class OpenAIServingChat(OpenAIServing):
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
-            tool_calls, content = self._parse_tool_calls_from_content(
-                request=request,
-                tokenizer=tokenizer,
-                content=content,
-                enable_auto_tools=self.enable_auto_tools,
-                tool_parser_cls=self.tool_parser,
-            )
+            try:
+                tool_calls, content = self._parse_tool_calls_from_content(
+                    request=request,
+                    tokenizer=tokenizer,
+                    content=content,
+                    enable_auto_tools=self.enable_auto_tools,
+                    tool_parser_cls=self.tool_parser,
+                )
+            except MalformedToolCallError as e:
+                # Mirrors the streaming-path handler at the top of this
+                # method: tool parser raised because args were unrecoverable
+                # or failed the post-repair schema gate. Convert to a clean
+                # 5XX so LiteLLM retries instead of letting the exception
+                # escape as an unstructured 500 stack trace.
+                from http import HTTPStatus
+
+                logger.error(
+                    "Malformed tool call for request %s: %s", request_id, e
+                )
+                return self.create_error_response(
+                    str(e),
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
 
             # Detect hallucinated tool-call patterns in reasoning content.
             # If the model generated degenerate tool-call-like text inside
