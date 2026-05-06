@@ -102,22 +102,23 @@ def _validate_or_repair_args(
     args_str: str,
     fn_name: str,
     request_id: str | None = None,
-) -> tuple[str | None, bool]:
+) -> tuple[str | None, Any, bool, str | None]:
     """Strict JSON parse with json-repair fallback.
 
-    Returns ``(args, was_repaired)`` where:
-      * ``(args_str, False)`` - input parses strictly; emitted as-is.
-      * ``(repaired, True)`` - input failed but json-repair recovered it.
-      * ``(None, True)`` - unrecoverable.
+    Returns ``(args, parsed, was_repaired, orig_err)`` where:
+      * ``(args_str, parsed, False, None)`` - input parses strictly.
+      * ``(repaired, parsed, True, orig_err)`` - json-repair recovered it.
+      * ``(None, None, True, orig_err)`` - unrecoverable.
 
-    Callers use ``was_repaired`` to decide whether to apply additional
-    safety gates (e.g. schema validation) - json-repair can silently drop
-    fields, so the post-repair value should not be trusted blindly.
+    The parsed value is returned so downstream schema validation can reuse
+    it without re-parsing the same string. ``orig_err`` carries the initial
+    JSONDecodeError message so callers can include it in raise reasons.
     """
     try:
-        json.loads(args_str)
-        return args_str, False
+        parsed = json.loads(args_str)
+        return args_str, parsed, False, None
     except json.JSONDecodeError as e:
+        orig_err = f"{e.msg} at pos {e.pos}"
         logger.warning(
             "Malformed Kimi K2 tool args for %s (request_id=%s) at pos %d: "
             "%s. arg_len=%d. Attempting repair.",
@@ -128,15 +129,15 @@ def _validate_or_repair_args(
             len(args_str),
         )
     if not _HAS_JSON_REPAIR or _repair_json is None:
-        return None, True
+        return None, None, True, orig_err
     try:
         repaired = _repair_json(args_str)
         if not repaired:
-            return None, True
-        json.loads(repaired)
+            return None, None, True, orig_err
+        parsed = json.loads(repaired)
     except Exception as err:
         logger.error("json_repair could not recover args for %s: %s", fn_name, err)
-        return None, True
+        return None, None, True, orig_err
     logger.warning(
         "Repaired Kimi K2 tool args for %s (request_id=%s) len %d -> %d. %s",
         fn_name,
@@ -145,7 +146,7 @@ def _validate_or_repair_args(
         len(repaired),
         _structural_diff(args_str, repaired),
     )
-    return repaired, True
+    return repaired, parsed, True, orig_err
 
 
 class KimiK2ToolParser(ToolParser):
@@ -395,17 +396,23 @@ class KimiK2ToolParser(ToolParser):
         )
 
     def _check_tool_call_issue(
-        self, function_args: str, function_name: str
+        self,
+        function_args: str,
+        function_name: str,
+        parsed_args: Any = None,
     ) -> str | None:
         """Return the malformation reason for a tool call, or None if OK.
 
-        Skips schema/name checks when the parser was constructed without a
-        tools list, since we have nothing to validate against.
+        Pass ``parsed_args`` when the caller has already parsed
+        ``function_args`` to skip a redundant ``json.loads``. Skips
+        schema/name checks when the parser was constructed without a tools
+        list.
         """
-        try:
-            parsed_args = json.loads(function_args)
-        except json.JSONDecodeError as e:
-            return f"invalid JSON arguments: {e}"
+        if parsed_args is None:
+            try:
+                parsed_args = json.loads(function_args)
+            except json.JSONDecodeError as e:
+                return f"invalid JSON arguments: {e}"
         if not self.tools:
             return None
         schema = self._get_tool_schema(function_name)
@@ -424,14 +431,16 @@ class KimiK2ToolParser(ToolParser):
         function_name: str,
         function_args: str,
         model_output: str,
+        parsed_args: Any = None,
     ) -> str | None:
         """Log if the tool call is malformed; return the reason (or None).
 
         Returns the reason string so callers can decide whether to drop the
-        call. Existing callers that just want observability can ignore the
-        return value.
+        call. Pass ``parsed_args`` to skip a redundant ``json.loads``.
         """
-        issue = self._check_tool_call_issue(function_args, function_name)
+        issue = self._check_tool_call_issue(
+            function_args, function_name, parsed_args
+        )
         if issue:
             self._log_malformed_tool_call(
                 request=request,
@@ -480,34 +489,46 @@ class KimiK2ToolParser(ToolParser):
                     function_id, function_args = match
                     # function_id: functions.get_weather:0 or get_weather:0
                     function_name = function_id.split(":")[0].split(".")[-1]
-                    repaired_args, was_repaired = _validate_or_repair_args(
+                    (
+                        repaired_args,
+                        parsed_args,
+                        was_repaired,
+                        orig_err,
+                    ) = _validate_or_repair_args(
                         function_args, function_name, request_id
                     )
                     if repaired_args is None:
                         # Unrecoverable malformed JSON. Log full context for
                         # production telemetry, then raise so serving.py
                         # converts to 500 and LiteLLM retries.
+                        unrecoverable_reason = (
+                            f"unrecoverable JSON args (json-repair failed): "
+                            f"{orig_err}"
+                        )
                         self._log_malformed_tool_call(
                             request=request,
                             function_id=function_id,
                             function_name=function_name,
                             function_args=function_args,
                             model_output=model_output,
-                            reason="unrecoverable JSON args (json-repair failed)",
+                            reason=unrecoverable_reason,
                         )
                         _raise_malformed_tool_call(
                             f"unrecoverable JSON args for {function_name} "
-                            f"(tool_call_id={function_id}, request_id={request_id})"
+                            f"(tool_call_id={function_id}, "
+                            f"request_id={request_id}): {orig_err}"
                         )
                     # Schema-validate the repaired args. json-repair can
                     # silently drop fields, so we run schema checks on the
-                    # post-repair value, not the raw model output.
+                    # post-repair value. Pass parsed_args to skip a
+                    # redundant json.loads.
                     issue = self._log_if_malformed_tool_call(
                         request=request,
                         function_id=function_id,
                         function_name=function_name,
                         function_args=repaired_args,
                         model_output=model_output,
+                        parsed_args=parsed_args,
                     )
                     # If json-repair produced JSON that fails schema (e.g.
                     # silently dropped a required field), raise so LiteLLM
@@ -519,7 +540,7 @@ class KimiK2ToolParser(ToolParser):
                         _raise_malformed_tool_call(
                             f"post-repair {issue} for {function_name} "
                             f"(tool_call_id={function_id}, "
-                            f"request_id={request_id})"
+                            f"request_id={request_id}, orig_err={orig_err})"
                         )
                     tool_calls.append(
                         ToolCall(
@@ -777,21 +798,28 @@ class KimiK2ToolParser(ToolParser):
                         "name", "unknown"
                     )
                     request_id = getattr(request, "request_id", None)
-                    repaired_full, was_repaired = _validate_or_repair_args(
+                    (
+                        repaired_full,
+                        parsed_full,
+                        was_repaired,
+                        orig_err,
+                    ) = _validate_or_repair_args(
                         proposed_full, fn_name, request_id
                     )
                     if repaired_full is None:
                         logger.error(
                             "Streaming repair failed for %s (request_id=%s); "
-                            "raising so client retries. full_len=%d",
+                            "raising so client retries. full_len=%d, "
+                            "orig_err=%s",
                             fn_name,
                             request_id,
                             len(proposed_full),
+                            orig_err,
                         )
                         _raise_malformed_tool_call(
                             f"streaming: unrecoverable JSON args for "
                             f"{fn_name} (request_id={request_id}, "
-                            f"full_len={len(proposed_full)})"
+                            f"full_len={len(proposed_full)}): {orig_err}"
                         )
                     if was_repaired and repaired_full != proposed_full:
                         if not repaired_full.startswith(already_streamed):
@@ -814,7 +842,11 @@ class KimiK2ToolParser(ToolParser):
                             )
                         # Prefix-preserving repair. Schema-gate before we
                         # apply: refuse to ship repair-corrupted args.
-                        issue = self._check_tool_call_issue(repaired_full, fn_name)
+                        # parsed_full is the already-parsed repaired value,
+                        # passed through to skip a redundant json.loads.
+                        issue = self._check_tool_call_issue(
+                            repaired_full, fn_name, parsed_full
+                        )
                         if issue:
                             logger.error(
                                 "Streaming: post-repair %s for %s "
@@ -825,7 +857,8 @@ class KimiK2ToolParser(ToolParser):
                             )
                             _raise_malformed_tool_call(
                                 f"streaming: post-repair {issue} for "
-                                f"{fn_name} (request_id={request_id})"
+                                f"{fn_name} (request_id={request_id}, "
+                                f"orig_err={orig_err})"
                             )
                         new_diff = repaired_full[len(already_streamed) :]
                         logger.warning(

@@ -334,33 +334,41 @@ def test_extract_tool_calls_repair_production_sample(kimi_k2_tool_parser):
 def test_validate_or_repair_args_strict_passthrough():
     """Already-valid JSON should pass through unchanged with was_repaired=False."""
     src = '{"a": 1, "b": "hello"}'
-    out, was_repaired = _validate_or_repair_args(src, "fn")
+    out, parsed, was_repaired, orig_err = _validate_or_repair_args(src, "fn")
     assert out == src
+    assert parsed == {"a": 1, "b": "hello"}
     assert was_repaired is False
+    assert orig_err is None
 
 
 def test_validate_or_repair_args_missing_close_brace():
     src = '{"city": "Beijing"'
-    out, was_repaired = _validate_or_repair_args(src, "get_weather")
+    out, parsed, was_repaired, orig_err = _validate_or_repair_args(src, "get_weather")
     assert out is not None
     assert was_repaired is True
+    assert orig_err is not None
+    assert parsed == {"city": "Beijing"}
     assert json.loads(out) == {"city": "Beijing"}
 
 
 def test_validate_or_repair_args_invalid_escape():
     """Haskell-style `\\_` escape should be repaired."""
     src = '{"code": "let x = 1\\_2"}'
-    out, was_repaired = _validate_or_repair_args(src, "run")
+    out, parsed, was_repaired, orig_err = _validate_or_repair_args(src, "run")
     assert out is not None
     assert was_repaired is True
+    assert orig_err is not None
+    assert isinstance(parsed, dict)
     json.loads(out)  # must parse
 
 
 def test_validate_or_repair_args_trailing_junk():
     src = '{"a": 1} unexpected trailing stuff'
-    out, was_repaired = _validate_or_repair_args(src, "fn")
+    out, parsed, was_repaired, orig_err = _validate_or_repair_args(src, "fn")
     assert out is not None
     assert was_repaired is True
+    assert orig_err is not None
+    assert parsed == {"a": 1}
     assert json.loads(out) == {"a": 1}
 
 
@@ -380,12 +388,17 @@ def test_structural_diff_dropped_field():
 
 def test_validate_or_repair_args_unrecoverable():
     """Pure garbage with no recoverable JSON returns None."""
-    out, was_repaired = _validate_or_repair_args("@@@ not json at all @@@", "fn")
+    out, parsed, was_repaired, orig_err = _validate_or_repair_args(
+        "@@@ not json at all @@@", "fn"
+    )
     assert was_repaired is True
+    assert orig_err is not None
     # json-repair is permissive and may produce an empty container; either
     # None or empty-but-parseable is acceptable - the contract is that the
     # returned string is parseable or None.
-    if out is not None:
+    if out is None:
+        assert parsed is None
+    else:
         json.loads(out)
 
 
@@ -515,7 +528,12 @@ def test_extract_tool_calls_unrecoverable_json_raises(kimi_k2_tokenizer):
     )
     real = kk2._validate_or_repair_args
     try:
-        kk2._validate_or_repair_args = lambda *a, **kw: (None, True)  # type: ignore[assignment]
+        kk2._validate_or_repair_args = lambda *a, **kw: (  # type: ignore[assignment]
+            None,
+            None,
+            True,
+            "synthetic error at pos 0",
+        )
         with pytest.raises(MalformedToolCallError, match="unrecoverable"):
             parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
     finally:
