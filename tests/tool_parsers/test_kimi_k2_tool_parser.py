@@ -39,12 +39,9 @@ def assert_tool_calls(
         assert actual_tool_call.type == "function"
         assert actual_tool_call.function == expected_tool_call.function
 
-        # assert tool call id format: should contain function name and numeric index
-        # Format can be either "functions.func_name:0" or "func_name:0"
-        assert actual_tool_call.id.split(":")[-1].isdigit()
-        assert (
-            actual_tool_call.id.split(":")[0].split(".")[-1]
-            == expected_tool_call.function.name
+        # Tool call IDs are random UUIDs: chatcmpl-tool-<16-hex-chars>
+        assert actual_tool_call.id.startswith("chatcmpl-tool-"), (
+            f"Expected random ID format, got: {actual_tool_call.id}"
         )
 
 
@@ -102,7 +99,6 @@ def test_extract_tool_calls_no_tools(kimi_k2_tool_parser):
 functions.get_weather:0 <|tool_call_argument_begin|> {"city": "Beijing"} <|tool_call_end|> <|tool_calls_section_end|>""",
             [
                 ToolCall(
-                    id="functions.get_weather:0",
                     function=FunctionCall(
                         name="get_weather",
                         arguments=json.dumps(
@@ -122,7 +118,6 @@ functions.get_weather:0 <|tool_call_argument_begin|> {"city": "Beijing"} <|tool_
 functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool_call_end|> <|tool_calls_section_end|>""",
             [
                 ToolCall(
-                    id="functions.get_weather:0",
                     function=FunctionCall(
                         name="get_weather",
                         arguments=json.dumps(
@@ -134,7 +129,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
                     type="function",
                 ),
                 ToolCall(
-                    id="functions.get_weather:1",
                     function=FunctionCall(
                         name="get_weather",
                         arguments=json.dumps(
@@ -152,7 +146,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
             """I'll get the weather and news for LA today. First, let me get the weather using Los Angeles coordinates, and then get the latest news. <|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"latitude": 34.0522, "longitude": -118.2437}<|tool_call_end|><|tool_call_begin|>functions.get_news:1<|tool_call_argument_begin|>{"content": "Los Angeles today"}<|tool_call_end|><|tool_calls_section_end|>""",
             [
                 ToolCall(
-                    id="functions.get_weather:0",
                     function=FunctionCall(
                         name="get_weather",
                         arguments=json.dumps(
@@ -162,7 +155,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
                     type="function",
                 ),
                 ToolCall(
-                    id="functions.get_news:1",
                     function=FunctionCall(
                         name="get_news",
                         arguments=json.dumps({"content": "Los Angeles today"}),
@@ -176,7 +168,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
             """I'll help you with multiple tasks. <|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "New York"}<|tool_call_end|><|tool_call_begin|>functions.get_news:1<|tool_call_argument_begin|>{"topic": "technology"}<|tool_call_end|><|tool_call_begin|>functions.send_email:2<|tool_call_argument_begin|>{"to": "user@example.com", "subject": "Daily Update"}<|tool_call_end|><|tool_calls_section_end|>""",
             [
                 ToolCall(
-                    id="functions.get_weather:0",
                     function=FunctionCall(
                         name="get_weather",
                         arguments=json.dumps({"city": "New York"}),
@@ -184,7 +175,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
                     type="function",
                 ),
                 ToolCall(
-                    id="functions.get_news:1",
                     function=FunctionCall(
                         name="get_news",
                         arguments=json.dumps({"topic": "technology"}),
@@ -192,7 +182,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
                     type="function",
                 ),
                 ToolCall(
-                    id="functions.send_email:2",
                     function=FunctionCall(
                         name="send_email",
                         arguments=json.dumps(
@@ -208,7 +197,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
             """Mixed spacing test. <|tool_calls_section_begin|> <|tool_call_begin|> functions.test:0 <|tool_call_argument_begin|> {} <|tool_call_end|><|tool_call_begin|>functions.test2:1<|tool_call_argument_begin|>{}<|tool_call_end|> <|tool_calls_section_end|>""",
             [
                 ToolCall(
-                    id="functions.test:0",
                     function=FunctionCall(
                         name="test",
                         arguments=json.dumps({}),
@@ -216,7 +204,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
                     type="function",
                 ),
                 ToolCall(
-                    id="functions.test2:1",
                     function=FunctionCall(
                         name="test2",
                         arguments=json.dumps({}),
@@ -230,7 +217,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
             """I need to process HTML content. <|tool_calls_section_begin|><|tool_call_begin|>functions.process_html:0<|tool_call_argument_begin|>{"html": "<div>content</div>", "text": "normal text"}<|tool_call_end|><|tool_calls_section_end|>""",
             [
                 ToolCall(
-                    id="functions.process_html:0",
                     function=FunctionCall(
                         name="process_html",
                         arguments=json.dumps(
@@ -252,7 +238,6 @@ functions.get_weather:1 <|tool_call_argument_begin|> {"city": "Shanghai"} <|tool
 }<|tool_call_end|><|tool_calls_section_end|>""",
             [
                 ToolCall(
-                    id="functions.process_data:0",
                     function=FunctionCall(
                         name="process_data",
                         arguments=json.dumps(
@@ -1164,3 +1149,285 @@ def test_streaming_multiple_tool_calls_not_leaked(kimi_k2_tool_parser):
 
     # Legitimate content preserved
     assert "compare" in full_content.lower() or len(all_content) > 0
+
+
+# ---------------------------------------------------------------------------
+# Helper to build a ChatCompletionRequest with tools for normalization tests
+# ---------------------------------------------------------------------------
+
+def _make_request_with_tools(tools_spec: list[dict]):
+    """Build a minimal ChatCompletionRequest with the given tool definitions."""
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionToolsParam,
+    )
+    from vllm.entrypoints.openai.engine.protocol import FunctionDefinition
+
+    tools = []
+    for spec in tools_spec:
+        tools.append(
+            ChatCompletionToolsParam(
+                function=FunctionDefinition(**spec)
+            )
+        )
+    return ChatCompletionRequest(messages=[], tools=tools)
+
+
+# ---------------------------------------------------------------------------
+# _extract_function_name unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_extract_function_name_standard_format(kimi_k2_tool_parser):
+    """Strategy 1: standard 'functions.name:index' and 'name:index'."""
+    assert (
+        kimi_k2_tool_parser._extract_function_name(
+            "functions.get_weather:0", "{}", None
+        )
+        == "get_weather"
+    )
+    assert (
+        kimi_k2_tool_parser._extract_function_name("get_weather:0", "{}", None)
+        == "get_weather"
+    )
+
+
+def test_extract_function_name_toolu_prefix_strategy1_rejected(kimi_k2_tool_parser):
+    """Strategy 1 should reject names starting with 'toolu_' and fall through."""
+    # The ID "functions.toolu_vrtx_xxx:0" has name "toolu_vrtx_xxx" after
+    # split, which starts with "toolu_" — Strategy 1 skips it.
+    # With no request tools, falls to Strategy 3 (raw ID as name).
+    name = kimi_k2_tool_parser._extract_function_name(
+        "functions.toolu_vrtx_xxx:0", "{}", None
+    )
+    # Strategy 3 fallback: uses the raw ID
+    assert name == "functions.toolu_vrtx_xxx:0"
+
+
+def test_extract_function_name_parameter_overlap(kimi_k2_tool_parser):
+    """Strategy 2: match argument keys against tool parameter schemas."""
+    request = _make_request_with_tools([
+        {
+            "name": "Grep",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "output_mode": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+            },
+        },
+        {
+            "name": "Edit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+            },
+        },
+    ])
+
+    # Args match Grep's params (pattern, output_mode, path)
+    name = kimi_k2_tool_parser._extract_function_name(
+        "toolu_vrtx_01SLHy9bdFTnvngLJiA3BBRU",
+        '{"pattern": "updateTxn", "output_mode": "content", "path": "/home/repo"}',
+        request,
+    )
+    assert name == "Grep"
+
+    # Args match Edit's params (file_path, old_string, new_string)
+    name = kimi_k2_tool_parser._extract_function_name(
+        "functions.toolu_01FhCzpCe7fsuFBWSWt41ddB:0",
+        '{"file_path": "/foo.ts", "old_string": "x", "new_string": "y"}',
+        request,
+    )
+    assert name == "Edit"
+
+
+def test_extract_function_name_fallback_no_request(kimi_k2_tool_parser):
+    """Strategy 3: fallback when no request and non-standard ID."""
+    name = kimi_k2_tool_parser._extract_function_name(
+        "toolu_vrtx_01SLHy9bdFTnvngLJiA3BBRU",
+        '{"pattern": "test"}',
+        None,  # type: ignore[arg-type]
+    )
+    # No request → Strategy 2 skipped → Strategy 3 returns raw ID
+    assert name == "toolu_vrtx_01SLHy9bdFTnvngLJiA3BBRU"
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming extract_tool_calls with non-standard IDs
+# ---------------------------------------------------------------------------
+
+
+def test_extract_tool_calls_toolu_id_with_tools(kimi_k2_tokenizer):
+    """Non-streaming: 'functions.toolu_xxx' ID with request.tools should
+    resolve function name via parameter overlap and produce a random ID."""
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionToolsParam,
+    )
+    from vllm.entrypoints.openai.engine.protocol import FunctionDefinition
+
+    tools = [
+        ChatCompletionToolsParam(
+            function=FunctionDefinition(
+                name="Edit",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                        "replace_all": {"type": "boolean"},
+                    },
+                },
+            )
+        )
+    ]
+    request = ChatCompletionRequest(messages=[], tools=tools)
+    parser = KimiK2ToolParser(kimi_k2_tokenizer)
+
+    args = json.dumps({
+        "replace_all": False,
+        "file_path": "/Users/mihir.jaiswal/Desktop/blend-design-system/apps/ascent/app/docs/utils/index.ts",
+        "old_string": "export {\\n    default as scanDirectory,\\n    buildVersionPeerMap,\\n    type DocItem,\\n} from './scanDirectory'",
+        "new_string": "export {\\n    default as scanDirectory,\\n    buildVersionPeerMap,\\n    buildSidebarItemsWithCategories,\\n    type DocItem,\\n} from './scanDirectory'",
+    })
+    model_output = (
+        f"I need to update the exports. "
+        f"<|tool_calls_section_begin|> <|tool_call_begin|> "
+        f"functions.Edit:16 <|tool_call_argument_begin|> {args} "
+        f"<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+
+    extracted = parser.extract_tool_calls(model_output, request)
+    assert extracted.tools_called
+    assert len(extracted.tool_calls) == 1
+    tc = extracted.tool_calls[0]
+    assert tc.function.name == "Edit"
+    # ID should be random (chatcmpl-tool-<uuid>)
+    assert tc.id.startswith("chatcmpl-tool-")
+    # Arguments should be parseable JSON
+    json.loads(tc.function.arguments)
+
+
+def test_extract_tool_calls_no_colon_id_with_tools(kimi_k2_tokenizer):
+    """Non-streaming: 'toolu_vrtx_xxx' (no colon) with request.tools should
+    resolve function name via parameter overlap and produce a random ID."""
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionToolsParam,
+    )
+    from vllm.entrypoints.openai.engine.protocol import FunctionDefinition
+
+    tools = [
+        ChatCompletionToolsParam(
+            function=FunctionDefinition(
+                name="Grep",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "output_mode": {"type": "string"},
+                        "path": {"type": "string"},
+                    },
+                },
+            )
+        )
+    ]
+    request = ChatCompletionRequest(messages=[], tools=tools)
+    parser = KimiK2ToolParser(kimi_k2_tokenizer)
+
+    model_output = (
+        "<|tool_calls_section_begin|> <|tool_call_begin|> "
+        "toolu_vrtx_01SLHy9bdFTnvngLJiA3BBRU <|tool_call_argument_begin|> "
+        '{"pattern": "updateTxnAndPayoutWithAudit", "output_mode": "content", "path": "/home/repo"} '
+        "<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+
+    extracted = parser.extract_tool_calls(model_output, request)
+    assert extracted.tools_called
+    assert len(extracted.tool_calls) == 1
+    tc = extracted.tool_calls[0]
+    assert tc.function.name == "Grep"
+    # ID should be random (chatcmpl-tool-<uuid>)
+    assert tc.id.startswith("chatcmpl-tool-")
+    json.loads(tc.function.arguments)
+
+
+def test_extract_tool_calls_no_request_with_standard_id(kimi_k2_tool_parser):
+    """Standard IDs should work identically when request=None; the parser
+    produces random IDs regardless of the model's native ID format."""
+    model_output = (
+        "<|tool_calls_section_begin|> <|tool_call_begin|> "
+        "functions.get_weather:0 <|tool_call_argument_begin|> "
+        '{"city": "Beijing"} '
+        "<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+    extracted = kimi_k2_tool_parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
+    assert extracted.tools_called
+    assert len(extracted.tool_calls) == 1
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert extracted.tool_calls[0].id.startswith("chatcmpl-tool-")
+
+
+def test_empty_tool_calls_guard(kimi_k2_tool_parser):
+    """When section markers are present but regex extracts zero calls,
+    tools_called should be False (not True with empty list)."""
+    # The invalid_funcall test already covers this scenario, but let's
+    # also test with just markers and unparseable content
+    model_output = (
+        "<|tool_calls_section_begin|> some noise without proper markers "
+        "<|tool_calls_section_end|>"
+    )
+    extracted = kimi_k2_tool_parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
+    assert not extracted.tools_called
+    assert extracted.tool_calls == []
+
+
+def test_tool_call_ids_are_unique(kimi_k2_tool_parser):
+    """Tool call IDs must be unique across extractions — never repeated.
+    This is critical for agents that don't scope IDs per message."""
+    model_output = (
+        "<|tool_calls_section_begin|> <|tool_call_begin|> "
+        "functions.get_weather:0 <|tool_call_argument_begin|> "
+        '{"city": "Beijing"} '
+        "<|tool_call_end|> <|tool_calls_section_end|>"
+    )
+
+    # Extract the same model output multiple times
+    ids = set()
+    for _ in range(20):
+        extracted = kimi_k2_tool_parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
+        assert extracted.tools_called
+        assert len(extracted.tool_calls) == 1
+        ids.add(extracted.tool_calls[0].id)
+
+    # All 20 extractions should produce unique IDs
+    assert len(ids) == 20, (
+        f"Expected 20 unique IDs, got {len(ids)}. "
+        f"IDs must be unique to prevent confusion in multi-turn agent loops."
+    )
+
+
+def test_tool_call_ids_unique_within_multi_call(kimi_k2_tool_parser):
+    """Multiple tool calls in a single extraction must also have unique IDs."""
+    model_output = (
+        "<|tool_calls_section_begin|><|tool_call_begin|>"
+        "functions.get_weather:0<|tool_call_argument_begin|>"
+        '{"city": "NYC"}'
+        "<|tool_call_end|>"
+        "<|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>"
+        '{"city": "LA"}'
+        "<|tool_call_end|>"
+        "<|tool_calls_section_end|>"
+    )
+    extracted = kimi_k2_tool_parser.extract_tool_calls(model_output, request=None)  # type: ignore[arg-type]
+    assert extracted.tools_called
+    assert len(extracted.tool_calls) == 2
+    ids = [tc.id for tc in extracted.tool_calls]
+    assert ids[0] != ids[1], "Tool calls within the same extraction must have unique IDs"
+    assert all(tid.startswith("chatcmpl-tool-") for tid in ids)

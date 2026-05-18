@@ -8,6 +8,7 @@ from typing import Any, NoReturn
 
 import regex as re
 
+from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
 )
@@ -185,15 +186,15 @@ class KimiK2ToolParser(ToolParser):
         self.tool_call_end_token: str = "<|tool_call_end|>"
 
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^<]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>(?:(?!<\|tool_call_begin\|>).)*?)\s*<\|tool_call_end\|>",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>\S+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>(?:(?!<\|tool_call_begin\|>).)*?)\s*<\|tool_call_end\|>",
             re.DOTALL,
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"(?P<tool_call_id>.+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*)"
+            r"(?P<tool_call_id>[^<\s]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*)"
         )
 
-        self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>.+:\d+)\s*")
+        self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>[^<\s]+)\s*")
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -254,6 +255,74 @@ class KimiK2ToolParser(ToolParser):
         self.in_tool_section = False
         self.token_buffer = ""
         self.section_char_count = 0
+
+    def _extract_function_name(
+        self,
+        tool_call_id: str,
+        arguments: str,
+        request: ChatCompletionRequest | None,
+    ) -> str:
+        """Extract function name from tool call ID or fall back to request tools.
+
+        ID formats handled:
+          - functions.get_weather:0  -> "get_weather"
+          - get_weather:0            -> "get_weather"
+          - call_xxx / toolu_vrtx_xxx -> match against request.tools
+        """
+        # Strategy 1: standard format "functions.name:index" or "name:index"
+        if ":" in tool_call_id:
+            name = tool_call_id.split(":")[0].split(".")[-1]
+            if name and not name.startswith("call_") and not name.startswith(
+                "toolu_"
+            ):
+                return name
+
+        # Strategy 2: try to match argument keys against tool definitions
+        if request is not None and request.tools:
+            try:
+                arg_obj = json.loads(arguments) if arguments else {}
+            except (json.JSONDecodeError, TypeError):
+                arg_obj = {}
+
+            arg_keys = set(arg_obj.keys())
+            if arg_keys:
+                best_match = None
+                best_score = -1
+                for tool in request.tools:
+                    if not hasattr(tool, "function") or not tool.function:
+                        continue
+                    tool_params = set()
+                    if (
+                        tool.function.parameters
+                        and hasattr(tool.function.parameters, "get")
+                    ):
+                        tool_params = set(
+                            tool.function.parameters.get("properties", {}).keys()
+                        )
+                    # Score: number of argument keys that match tool parameters
+                    overlap = arg_keys & tool_params
+                    score = len(overlap)
+                    if score > best_score:
+                        best_score = score
+                        best_match = tool.function.name
+
+                if best_match and best_score > 0:
+                    logger.debug(
+                        "Matched function name '%s' for ID '%s' "
+                        "via parameter overlap (score=%d)",
+                        best_match,
+                        tool_call_id,
+                        best_score,
+                    )
+                    return best_match
+
+        # Strategy 3: fallback — use the ID as-is
+        logger.warning(
+            "Could not determine function name for tool call ID '%s', "
+            "using ID as function name",
+            tool_call_id,
+        )
+        return tool_call_id
 
     def reset_streaming_state(self) -> None:
         """
@@ -426,8 +495,9 @@ class KimiK2ToolParser(ToolParser):
                 tool_calls = []
                 for match in function_call_tuples:
                     function_id, function_args = match
-                    # function_id: functions.get_weather:0 or get_weather:0
-                    function_name = function_id.split(":")[0].split(".")[-1]
+                    function_name = self._extract_function_name(
+                        function_id, function_args, request
+                    )
                     (
                         repaired_args,
                         parsed_args,
@@ -465,7 +535,7 @@ class KimiK2ToolParser(ToolParser):
                             )
                     tool_calls.append(
                         ToolCall(
-                            id=function_id,
+                            id=make_tool_call_id(),
                             type="function",
                             function=FunctionCall(
                                 name=function_name, arguments=repaired_args
@@ -474,6 +544,14 @@ class KimiK2ToolParser(ToolParser):
                     )
 
                 content = model_output[: model_output.find(self.tool_calls_start_token)]
+                if not tool_calls:
+                    logger.warning(
+                        "Tool section found but no tool calls parsed from: %s",
+                        model_output[:200],
+                    )
+                    return ExtractedToolCallInformation(
+                        tools_called=False, tool_calls=[], content=model_output
+                    )
                 return ExtractedToolCallInformation(
                     tools_called=True,
                     tool_calls=tool_calls,
@@ -802,8 +880,10 @@ class KimiK2ToolParser(ToolParser):
                 )
                 if current_tool_call_matches:
                     tool_id, tool_args = current_tool_call_matches.groups()
-                    tool_name = tool_id.split(":")[0].split(".")[-1]
-                    current_tool_call["id"] = tool_id.strip()
+                    tool_name = self._extract_function_name(
+                        tool_id, tool_args, request
+                    )
+                    current_tool_call["id"] = make_tool_call_id()
                     current_tool_call["name"] = tool_name
                     current_tool_call["arguments"] = tool_args
                 else:
@@ -812,8 +892,10 @@ class KimiK2ToolParser(ToolParser):
                     )
                     if current_tool_call_name_matches:
                         (tool_id_str,) = current_tool_call_name_matches.groups()
-                        tool_name = tool_id_str.split(":")[0].split(".")[-1]
-                        current_tool_call["id"] = tool_id_str.strip()
+                        tool_name = self._extract_function_name(
+                            tool_id_str, "", request
+                        )
+                        current_tool_call["id"] = make_tool_call_id()
                         current_tool_call["name"] = tool_name
                         current_tool_call["arguments"] = ""
                     else:
