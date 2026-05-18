@@ -414,6 +414,11 @@ class OpenAIServingChat(OpenAIServing):
         assert len(generators) == 1
         (result_generator,) = generators
 
+        logger.info("[chat-request] request_id=%s model=%s messages=%s",
+                    request_id, request.model,
+                    repr([m if isinstance(m, dict) else m.model_dump()
+                          for m in request.messages]))
+
         if request.stream:
             return self.chat_completion_stream_generator(
                 request,
