@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -82,6 +83,14 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+# Hang diagnostics. When enabled, chat_completion_stream_generator logs a single
+# "HANG-DIAG" line per request at completion *or* cancellation (client disconnect /
+# upstream read-timeout). For a request that timed out with 0 tokens, it shows whether
+# the engine ever produced a token (ttft_engine=NEVER -> queue/prefill/engine stall) vs
+# produced tokens but emitted no chunk (gen_tokens>0, content_chunks=0 -> parser
+# suppression). Off by default; enable with VLLM_KIMI_HANG_DEBUG=1.
+_HANG_DEBUG = os.getenv("VLLM_KIMI_HANG_DEBUG", "0") == "1"
 
 
 class MalformedToolCallError(Exception):
@@ -673,8 +682,16 @@ class OpenAIServingChat(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        # --- hang diagnostics state (summarized in `finally`; see _HANG_DEBUG) ---
+        _hang_t0 = time.monotonic()
+        _hang_first_res = None  # time of first engine output (role chunk goes out here)
+        _hang_content_chunks = 0  # delta chunks actually emitted to the client
+        _hang_cancelled = False
+
         try:
             async for res in result_generator:
+                if _HANG_DEBUG and _hang_first_res is None:
+                    _hang_first_res = time.monotonic()
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -1506,6 +1523,8 @@ class OpenAIServingChat(OpenAIServing):
                             total_tokens=num_prompt_tokens + completion_tokens,
                         )
 
+                    if _HANG_DEBUG:
+                        _hang_content_chunks += 1
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
@@ -1594,6 +1613,31 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        except asyncio.CancelledError:
+            # client disconnected / upstream read-timeout fired before we finished
+            _hang_cancelled = True
+            raise
+        finally:
+            if _HANG_DEBUG:
+                _ttft_engine = (
+                    f"{_hang_first_res - _hang_t0:.1f}s"
+                    if _hang_first_res is not None
+                    else "NEVER"
+                )
+                logger.warning(
+                    "HANG-DIAG request_id=%s cancelled=%s finished=%s elapsed=%.1fs "
+                    "ttft_engine=%s prompt_tokens=%d gen_tokens=%d content_chunks=%d "
+                    "tool_choice_auto=%s",
+                    request_id,
+                    _hang_cancelled,
+                    any(finish_reason_sent),
+                    time.monotonic() - _hang_t0,
+                    _ttft_engine,
+                    num_prompt_tokens,
+                    sum(previous_num_tokens),
+                    _hang_content_chunks,
+                    tool_choice_auto,
+                )
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 
