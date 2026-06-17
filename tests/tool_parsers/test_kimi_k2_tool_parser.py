@@ -592,6 +592,7 @@ class TestStreamingIntervals:
 import vllm.tool_parsers.kimi_k2_tool_parser as kimi_mod  # noqa: E402
 from vllm.entrypoints.openai.chat_completion.serving import (  # noqa: E402
     MalformedToolCallError,
+    _detect_special_tokens_in_text,
 )
 
 _WEATHER_SCHEMA = {
@@ -654,3 +655,60 @@ class TestToolArgValidation:
         request.request_id = "req-2"
         with pytest.raises(MalformedToolCallError):
             parser.extract_tool_calls(out, request)
+
+    def test_unrecoverable_json_raises_with_repair_enabled(
+        self, parser, monkeypatch
+    ):
+        """Repair available but yields nothing usable => still fail-closed.
+        Guards the primary raise path with the real dependency present."""
+        monkeypatch.setattr(kimi_mod, "_HAS_JSON_REPAIR", True)
+        monkeypatch.setattr(kimi_mod, "_repair_json", lambda s: "")
+        out = "x " + _wrap(_tool("functions.get_weather:0", "not json at all"))
+        request = MagicMock(spec=ChatCompletionRequest)
+        request.request_id = "req-3"
+        with pytest.raises(MalformedToolCallError):
+            parser.extract_tool_calls(out, request)
+
+    def test_streaming_repairable_args_corrected_not_raised(self, parser):
+        """Malformed-but-repairable streaming args (missing brace + the
+        trailing space the wire carries) must be repaired via an append-only
+        corrective, NOT 500'd -- matching the non-streaming repair path.
+        Regression for the streamed-prefix vs whitespace mismatch."""
+        pytest.importorskip("json_repair")
+        # _split_tool_output_to_deltas appends a trailing space after args,
+        # so the streamed body is '{"city": "Beijing" ' (missing brace).
+        deltas = _split_tool_output_to_deltas(
+            "", [("functions.get_weather:0", '{"city": "Beijing"')]
+        )
+        rec = run_tool_extraction_streaming(parser, deltas)
+        assert len(rec.tool_calls) == 1
+        assert json.loads(rec.tool_calls[0].function.arguments) == {
+            "city": "Beijing"
+        }
+
+
+class TestServingLeakDetection:
+    """The serving-layer special-token leak check must not fire on Kimi's
+    own tool-call framing tokens (which surface as content for
+    tool_choice='none'), only on genuinely-unexpected control tokens."""
+
+    def test_kimi_tool_tokens_not_flagged(self):
+        content = (
+            SECTION_BEGIN
+            + TOOL_BEGIN
+            + "functions.get_weather:0 "
+            + ARG_BEGIN
+            + '{"city": "x"}'
+            + TOOL_END
+            + SECTION_END
+        )
+        assert _detect_special_tokens_in_text(content) is None
+
+    def test_genuine_leak_flagged(self):
+        assert (
+            _detect_special_tokens_in_text("oops <|im_start|> leak")
+            == "<|im_start|>"
+        )
+
+    def test_plain_content_not_flagged(self):
+        assert _detect_special_tokens_in_text("a < b | c > d, pipe|bar") is None

@@ -85,11 +85,11 @@ class MalformedToolCallError(Exception):
     """Raised when Kimi K2 emits unrecoverable tool-call output.
 
     Covers: unrecoverable/malformed tool-call JSON, post-repair schema
-    mismatch, leaked control tokens (``<|...|>``), a leaked reasoning-close
-    marker in content, or repeated hallucinated tool-call-like text in the
-    reasoning block. serving.py converts this to a clean HTTP 500 so LiteLLM
-    retries the request (the model rolls the dice again) rather than the
-    client receiving empty/garbage tool calls with no retry signal.
+    mismatch, leaked (unexpected) control tokens (``<|...|>``), or repeated
+    hallucinated tool-call-like text in the reasoning block. serving.py
+    converts this to a clean HTTP 500 so LiteLLM retries the request (the
+    model rolls the dice again) rather than the client receiving
+    empty/garbage tool calls with no retry signal.
     """
 
 
@@ -99,10 +99,17 @@ _HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
 # Anthropic-style tool calls the model sometimes hallucinates instead of
 # Kimi's native <|tool_call_begin|> format. Any occurrence is degenerate.
 _HALLUCINATED_ANTHROPIC_TOOL_PATTERN = re.compile(r"<function_calls>|<invoke\b")
-# Any control token <|...|> leaking into reasoning/content is degenerate.
+# Any control token <|...|> leaking into reasoning/content is degenerate...
 _SPECIAL_TOKEN_PATTERN = re.compile(r"<\|\S+?\|>")
-# A reasoning-close marker leaking into *content* as literal text.
-_LEAKED_REASONING_MARKER = "</thinking>"
+# ...EXCEPT Kimi's own tool-call framing tokens, which the reasoning parser
+# deliberately keeps in content (so the tool parser can find them) and which
+# appear as literal content for tool_choice="none". Those are expected, not a
+# leak, so strip them before the broad check to avoid spurious 500s.
+_KIMI_TOOL_TOKEN_PATTERN = re.compile(
+    r"<\|tool_calls?_section_(?:begin|end)\|>"
+    r"|<\|tool_call_(?:begin|end)\|>"
+    r"|<\|tool_call_argument_begin\|>"
+)
 
 
 def _detect_hallucinated_tool_calls_in_reasoning(
@@ -119,7 +126,13 @@ def _detect_anthropic_style_tool_calls(text: str) -> bool:
 
 
 def _detect_special_tokens_in_text(text: str) -> str | None:
-    """Return the first leaked control token ``<|...|>`` in *text*, or None."""
+    """Return the first *unexpected* leaked control token ``<|...|>``, or None.
+
+    Kimi's own tool-call framing tokens are expected here (the reasoning parser
+    keeps them in content for the tool parser; they also surface verbatim for
+    ``tool_choice="none"``), so they are stripped before the broad check.
+    """
+    text = _KIMI_TOOL_TOKEN_PATTERN.sub("", text)
     match = _SPECIAL_TOKEN_PATTERN.search(text)
     return match.group(0) if match else None
 
@@ -715,8 +728,10 @@ class OpenAIServingChat(OpenAIServing):
                     # Detect degenerate Kimi output (repeated hallucinated tool
                     # calls / leaked control tokens) and fail closed so LiteLLM
                     # retries. The reasoning -> content fallback is handled in
-                    # the parser (get_streaming_fallback_content).
-                    if self.reasoning_parser_cls is not None:
+                    # the parser (get_streaming_fallback_content). Harmony /
+                    # gpt_oss also sets a reasoning parser, so exclude it - this
+                    # detection is Kimi-specific.
+                    if self.reasoning_parser_cls is not None and not self.use_harmony:
                         if delta_message.reasoning:
                             accumulated_reasoning_arr[i] += delta_message.reasoning
                             if _detect_hallucinated_tool_calls_in_reasoning(
@@ -748,10 +763,6 @@ class OpenAIServingChat(OpenAIServing):
                             if leaked:
                                 raise MalformedToolCallError(
                                     f"special token {leaked!r} leaked into content"
-                                )
-                            if _LEAKED_REASONING_MARKER in delta_message.content:
-                                raise MalformedToolCallError(
-                                    "model leaked </thinking> into content"
                                 )
 
                     # Log streaming delta if output logging is enabled

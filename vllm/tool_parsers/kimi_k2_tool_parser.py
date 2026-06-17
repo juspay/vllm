@@ -593,7 +593,14 @@ class KimiK2ToolParser(ToolParser):
                             f"(request_id={request_id}): {orig_err}"
                         )
                     if was_repaired and repaired_full != tool_args:
-                        streamed = self.streamed_args_for_tool[i]
+                        # The streamed body can carry trailing whitespace that
+                        # repair normalizes away (the non-streaming regex strips
+                        # it via \s* outside the capture group). Compare against
+                        # the rstripped prefix so a benign trailing space doesn't
+                        # look like a changed prefix. The client's accumulated
+                        # args stay valid JSON (json.loads tolerates the space
+                        # between the streamed prefix and the corrective suffix).
+                        streamed = self.streamed_args_for_tool[i].rstrip()
                         if not repaired_full.startswith(streamed):
                             _raise_malformed_tool_call(
                                 f"streaming: repair for {fn_name} changed "
