@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,17 @@ from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+# Tool-related special tokens that are part of Kimi K2's tool-call format.
+# These are expected in model output (even without tools in the request) and
+# should be stripped from the *reasoning* channel rather than surfaced to the
+# client. (Content-side stripping is handled by the tool parser via
+# partial_tag_overlap.)
+_TOOL_SPECIAL_TOKEN_PATTERN = re.compile(
+    r"<\|tool_calls?_section_(?:begin|end)\|>"
+    r"|<\|tool_call_(?:begin|end)\|>"
+    r"|<\|tool_call_argument_begin\|>"
+)
 
 
 class KimiK2ReasoningParser(ReasoningParser):
@@ -52,18 +64,31 @@ class KimiK2ReasoningParser(ReasoningParser):
         self._end_token = "</think>"
         self._tool_section_start_token = "<|tool_calls_section_begin|>"
 
+        # Alternative end token the model may hallucinate instead of the
+        # canonical </think>. When seen, treat it as a reasoning-end marker so
+        # content after it is not swallowed into the reasoning block.
+        self._alt_end_token = "</thinking>"
+
         # Get token IDs
         self._start_token_id = self.vocab.get(self._start_token)
         self._end_token_id = self.vocab.get(self._end_token)
         self._tool_section_start_token_id = self.vocab.get(
             self._tool_section_start_token
         )
+        self._alt_end_token_id = self.vocab.get(self._alt_end_token)
 
         if self._start_token_id is None or self._end_token_id is None:
             raise RuntimeError(
                 "KimiK2ReasoningParser could not locate think start/end "
                 "tokens in the tokenizer!"
             )
+
+    @staticmethod
+    def _strip_tool_tokens(text: str | None) -> str | None:
+        """Strip Kimi tool-call special tokens from a reasoning string."""
+        if not text:
+            return text
+        return _TOOL_SPECIAL_TOKEN_PATTERN.sub("", text)
 
     @property
     def reasoning_start_str(self) -> str | None:
@@ -87,11 +112,15 @@ class KimiK2ReasoningParser(ReasoningParser):
         start_token_id = self._start_token_id
         end_token_id = self._end_token_id
         tool_section_start_token_id = self._tool_section_start_token_id
+        alt_end_token_id = self._alt_end_token_id
 
         for i in range(len(input_ids) - 1, -1, -1):
             if input_ids[i] == start_token_id:
                 return False
             if input_ids[i] == end_token_id:
+                return True
+            # Alternative end token (</thinking>) the model may hallucinate
+            if alt_end_token_id is not None and input_ids[i] == alt_end_token_id:
                 return True
             # Implicit reasoning end via tool call section
             if (
@@ -118,6 +147,12 @@ class KimiK2ReasoningParser(ReasoningParser):
         # Check for explicit end token or implicit tool section start in delta
         if self._end_token_id in delta_ids_set:
             return True
+        # Alternative end token (</thinking>)
+        if (
+            self._alt_end_token_id is not None
+            and self._alt_end_token_id in delta_ids_set
+        ):
+            return True
         return (
             self._tool_section_start_token_id is not None
             and self._tool_section_start_token_id in delta_ids_set
@@ -137,6 +172,18 @@ class KimiK2ReasoningParser(ReasoningParser):
 
             if end_token_index != -1:
                 return input_ids[end_token_index + 1 :]
+
+        # Alternative end token (</thinking>)
+        if (
+            self._alt_end_token_id is not None
+            and self._alt_end_token_id in input_ids
+        ):
+            alt_end_index = (
+                len(input_ids) - 1 - input_ids[::-1].index(self._alt_end_token_id)
+            )
+
+            if alt_end_index != -1:
+                return input_ids[alt_end_index + 1 :]
 
         if (
             self._tool_section_start_token_id is not None
@@ -170,20 +217,32 @@ class KimiK2ReasoningParser(ReasoningParser):
 
         if end_token_index != -1:
             return (
-                model_output[start_token_index:end_token_index],
+                self._strip_tool_tokens(model_output[start_token_index:end_token_index]),
                 model_output[end_token_index + len(self._end_token) :] or None,
+            )
+
+        # Alternative end token (</thinking>) the model may hallucinate
+        alt_end_index = model_output.find(self._alt_end_token)
+        if alt_end_index != -1:
+            return (
+                self._strip_tool_tokens(model_output[start_token_index:alt_end_index]),
+                model_output[alt_end_index + len(self._alt_end_token) :] or None,
             )
 
         tool_section_index = model_output.find(self._tool_section_start_token)
         if tool_section_index != -1:
+            # Keep the tool-section start token in content so the tool parser's
+            # extract_tool_calls() can detect tool calls via text matching.
             return (
-                model_output[start_token_index:tool_section_index],
+                self._strip_tool_tokens(
+                    model_output[start_token_index:tool_section_index]
+                ),
                 model_output[tool_section_index:] or None,
             )
 
         # still reasoning (no content)
         return (
-            model_output[start_token_index:],
+            self._strip_tool_tokens(model_output[start_token_index:]),
             None,
         )
 
@@ -214,10 +273,10 @@ class KimiK2ReasoningParser(ReasoningParser):
             return DeltaMessage(content=delta_text)
 
         # Skip single special tokens
-        if len(delta_token_ids) == 1 and delta_token_ids[0] in [
-            self._start_token_id,
-            self._end_token_id,
-        ]:
+        skip_token_ids = [self._start_token_id, self._end_token_id]
+        if self._alt_end_token_id is not None:
+            skip_token_ids.append(self._alt_end_token_id)
+        if len(delta_token_ids) == 1 and delta_token_ids[0] in skip_token_ids:
             return None
 
         if self._end_token_id in delta_token_ids:
@@ -226,8 +285,23 @@ class KimiK2ReasoningParser(ReasoningParser):
                 # Wait for the next delta when the text becomes visible.
                 return None
             end_index = delta_text.find(self._end_token)
-            reasoning = delta_text[:end_index]
+            reasoning = self._strip_tool_tokens(delta_text[:end_index])
             content = delta_text[end_index + len(self._end_token) :]
+            return DeltaMessage(
+                reasoning=reasoning, content=content if content else None
+            )
+
+        # Alternative end token (</thinking>) in delta
+        if (
+            self._alt_end_token_id is not None
+            and self._alt_end_token_id in delta_token_ids
+        ):
+            if self._alt_end_token not in delta_text:
+                # Token ID arrived before text was flushed (stop-sequence buffering).
+                return None
+            alt_end_index = delta_text.find(self._alt_end_token)
+            reasoning = self._strip_tool_tokens(delta_text[:alt_end_index])
+            content = delta_text[alt_end_index + len(self._alt_end_token) :]
             return DeltaMessage(
                 reasoning=reasoning, content=content if content else None
             )
@@ -237,9 +311,25 @@ class KimiK2ReasoningParser(ReasoningParser):
                 # Token ID arrived before text was flushed (stop-sequence buffering).
                 return None
             tool_index = delta_text.find(self._tool_section_start_token)
-            reasoning = delta_text[:tool_index]
+            reasoning = self._strip_tool_tokens(delta_text[:tool_index])
             content = delta_text[tool_index:]
             return DeltaMessage(reasoning=reasoning, content=content)
 
         # still reasoning (no end token)
-        return DeltaMessage(reasoning=delta_text)
+        return DeltaMessage(reasoning=self._strip_tool_tokens(delta_text))
+
+    def get_streaming_fallback_content(
+        self, text: str, request: "ChatCompletionRequest | ResponsesRequest"
+    ) -> str | None:
+        """Promote accumulated reasoning into content on the terminal streaming
+        delta when reasoning never ended (model produced no </think>,
+        </thinking>, or tool section), so OpenAI clients don't receive null
+        content. Invoked by DelegatingParser.finalize_generation only when
+        ``state.reasoning_ended`` is False.
+        """
+        if self._identity_parser is not None:
+            return None
+        reasoning, content = self.extract_reasoning(text, request)
+        if content is None and reasoning:
+            return reasoning
+        return None
