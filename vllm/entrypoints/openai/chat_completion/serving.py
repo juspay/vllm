@@ -3,6 +3,7 @@
 
 import asyncio
 import io
+import re
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -78,6 +79,49 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+
+class MalformedToolCallError(Exception):
+    """Raised when Kimi K2 emits unrecoverable tool-call output.
+
+    Covers: unrecoverable/malformed tool-call JSON, post-repair schema
+    mismatch, leaked control tokens (``<|...|>``), a leaked reasoning-close
+    marker in content, or repeated hallucinated tool-call-like text in the
+    reasoning block. serving.py converts this to a clean HTTP 500 so LiteLLM
+    retries the request (the model rolls the dice again) rather than the
+    client receiving empty/garbage tool calls with no retry signal.
+    """
+
+
+# Repeated hallucinated tool-call markers in reasoning => degenerate loop.
+_HALLUCINATED_TOOL_CALL_THRESHOLD = 3
+_HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
+# Anthropic-style tool calls the model sometimes hallucinates instead of
+# Kimi's native <|tool_call_begin|> format. Any occurrence is degenerate.
+_HALLUCINATED_ANTHROPIC_TOOL_PATTERN = re.compile(r"<function_calls>|<invoke\b")
+# Any control token <|...|> leaking into reasoning/content is degenerate.
+_SPECIAL_TOKEN_PATTERN = re.compile(r"<\|\S+?\|>")
+# A reasoning-close marker leaking into *content* as literal text.
+_LEAKED_REASONING_MARKER = "</thinking>"
+
+
+def _detect_hallucinated_tool_calls_in_reasoning(
+    reasoning: str, threshold: int = _HALLUCINATED_TOOL_CALL_THRESHOLD
+) -> bool:
+    """True if the reasoning text repeats a hallucinated tool-call marker
+    at least ``threshold`` times (model looping on tool-call-like text)."""
+    return reasoning.count(_HALLUCINATED_TOOL_CALL_MARKER) >= threshold
+
+
+def _detect_anthropic_style_tool_calls(text: str) -> bool:
+    """True if the text contains Anthropic-style hallucinated tool calls."""
+    return _HALLUCINATED_ANTHROPIC_TOOL_PATTERN.search(text) is not None
+
+
+def _detect_special_tokens_in_text(text: str) -> str | None:
+    """Return the first leaked control token ``<|...|>`` in *text*, or None."""
+    match = _SPECIAL_TOKEN_PATTERN.search(text)
+    return match.group(0) if match else None
 
 
 class OpenAIServingChat(OpenAIServing):
