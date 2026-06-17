@@ -148,8 +148,10 @@ class TestExtractToolCalls:
             # id format: "something:digit"
             assert tc.id.split(":")[-1].isdigit()
 
-    def test_invalid_json_still_extracted(self, parser):
-        """Tool calls with invalid JSON are still returned (arguments as-is)."""
+    def test_repairable_json_is_repaired(self, parser):
+        """Repairable invalid JSON (missing brace) is repaired, not passed
+        through as-is. (Juspay custom fix: json-repair fallback.)"""
+        pytest.importorskip("json_repair")
         model_output = (
             "Help. "
             + SECTION_BEGIN
@@ -161,6 +163,9 @@ class TestExtractToolCalls:
         assert len(tool_calls) == 2
         assert tool_calls[0].function.name == "bad"
         assert tool_calls[1].function.name == "good"
+        # args are now valid JSON after repair
+        assert json.loads(tool_calls[0].function.arguments) == {"city": "Beijing"}
+        assert json.loads(tool_calls[1].function.arguments) == {"city": "Shanghai"}
 
     def test_invalid_funcall_id_skipped(self, parser):
         """Tool calls with malformed id (no colon+digit) are skipped."""
@@ -580,3 +585,72 @@ class TestStreamingIntervals:
         assert len(rec.tool_calls) == 1
         assert rec.tool_calls[0].function.name == "get_weather"
         assert json.loads(rec.tool_calls[0].function.arguments) == {"city": "Beijing"}
+
+
+# --- Juspay custom fixes: JSON repair, schema-gate, fail-closed raises ---
+
+import vllm.tool_parsers.kimi_k2_tool_parser as kimi_mod  # noqa: E402
+from vllm.entrypoints.openai.chat_completion.serving import (  # noqa: E402
+    MalformedToolCallError,
+)
+
+_WEATHER_SCHEMA = {
+    "type": "object",
+    "required": ["city"],
+    "properties": {"city": {"type": "string"}},
+}
+
+
+class TestToolArgValidation:
+    def test_valid_args_pass_through_keep_id(self, parser):
+        """Valid args are emitted unchanged and keep nightly's captured id."""
+        out = "ok " + _wrap(_tool("functions.get_weather:0", '{"city": "Beijing"}'))
+        content, tool_calls = run_tool_extraction(parser, out, streaming=False)
+        assert len(tool_calls) == 1
+        assert tool_calls[0].id == "functions.get_weather:0"  # nightly id scheme
+        assert json.loads(tool_calls[0].function.arguments) == {"city": "Beijing"}
+
+    def test_unrecoverable_json_raises_when_repair_disabled(self, parser, monkeypatch):
+        """When json-repair is unavailable, malformed JSON is unrecoverable and
+        raises MalformedToolCallError (-> 500 -> LiteLLM retries)."""
+        monkeypatch.setattr(kimi_mod, "_HAS_JSON_REPAIR", False)
+        monkeypatch.setattr(kimi_mod, "_repair_json", None)
+        out = "x " + _wrap(_tool("functions.get_weather:0", '{"city": '))
+        request = MagicMock(spec=ChatCompletionRequest)
+        request.request_id = "req-1"
+        with pytest.raises(MalformedToolCallError):
+            parser.extract_tool_calls(out, request)
+
+    def test_check_tool_call_issue_schema_gating(self, parser):
+        """Schema gating only applies when tools are known (post-repair path)."""
+        # No tools => never gated (unknown names with valid JSON pass).
+        assert parser._check_tool_call_issue('{"city": "x"}', "anything") is None
+
+        # With a known schema, valid args pass, missing-required fails,
+        # and an unknown tool name is flagged.
+        parser.tools = [{"function": {"name": "get_weather",
+                                      "parameters": _WEATHER_SCHEMA}}]
+        assert parser._check_tool_call_issue('{"city": "x"}', "get_weather") is None
+        assert parser._check_tool_call_issue('{"x": 1}', "get_weather") is not None
+        assert parser._check_tool_call_issue('{"city": "x"}', "other") == (
+            "unknown tool name"
+        )
+
+    def test_validate_schema_subset(self, parser):
+        assert parser._validate_schema_subset({"city": "x"}, _WEATHER_SCHEMA) == []
+        assert parser._validate_schema_subset({}, _WEATHER_SCHEMA)  # missing required
+        assert parser._validate_schema_subset(
+            {"city": 5}, _WEATHER_SCHEMA
+        )  # type mismatch
+
+    def test_post_repair_schema_mismatch_raises(self, parser):
+        """Repairable-but-schema-violating args raise (fail-closed)."""
+        parser.tools = [{"function": {"name": "get_weather",
+                                      "parameters": _WEATHER_SCHEMA}}]
+        # Trailing comma => repairable; repaired drops nothing but is missing
+        # the required 'city' field => post-repair schema mismatch => raise.
+        out = "x " + _wrap(_tool("functions.get_weather:0", '{"wrong": "v",}'))
+        request = MagicMock(spec=ChatCompletionRequest)
+        request.request_id = "req-2"
+        with pytest.raises(MalformedToolCallError):
+            parser.extract_tool_calls(out, request)
