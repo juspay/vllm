@@ -1613,8 +1613,11 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
-        except asyncio.CancelledError:
-            # client disconnected / upstream read-timeout fired before we finished
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client disconnect / upstream read-timeout before we finished.
+            # Starlette tears the async generator down via aclose() -> GeneratorExit
+            # at the suspended yield; a task cancel arrives as CancelledError. Catch
+            # both so the diag line records cancelled=True for either teardown path.
             _hang_cancelled = True
             raise
         finally:
