@@ -478,10 +478,13 @@ class OpenAIServingChat(OpenAIServing):
             history_tool_call_cnt = 0
 
         previous_texts = [""] * num_choices
-        # Accumulated reasoning per choice, for hallucination detection. The
-        # reasoning -> content fallback itself is handled by the reasoning
-        # parser's get_streaming_fallback_content() via finalize_generation.
+        # Accumulated reasoning per choice (for hallucination detection AND the
+        # reasoning -> content fallback). The reasoning parser's
+        # get_streaming_fallback_content() handles the case where reasoning
+        # never ended; seen_content_arr lets us also cover the case where it
+        # DID end (</think> closed) but no content followed.
         accumulated_reasoning_arr = [""] * num_choices
+        seen_content_arr = [False] * num_choices
 
         try:
             if self.parser_cls is not None:
@@ -738,6 +741,7 @@ class OpenAIServingChat(OpenAIServing):
                                     f"special token {leaked!r} leaked into reasoning"
                                 )
                         if delta_message.content:
+                            seen_content_arr[i] = True
                             leaked = _detect_special_tokens_in_text(
                                 delta_message.content
                             )
@@ -811,6 +815,26 @@ class OpenAIServingChat(OpenAIServing):
                             finish_reason_ = (
                                 output.finish_reason if output.finish_reason else "stop"
                             )
+
+                        # reasoning -> content fallback for the case the parser
+                        # hook can't reach: reasoning DID end (</think> closed)
+                        # but no content and no tool calls followed, so content
+                        # is empty. (The never-closed-think case is handled by
+                        # the reasoning parser's get_streaming_fallback_content
+                        # via finalize_generation, which by now has already set
+                        # content -> seen_content_arr[i] is True -> skip here.)
+                        if (
+                            self.reasoning_parser_cls is not None
+                            and not self.use_harmony
+                            and not seen_content_arr[i]
+                            and not tools_streamed[i]
+                            and accumulated_reasoning_arr[i]
+                        ):
+                            if delta_message is None:
+                                delta_message = DeltaMessage()
+                            delta_message.content = accumulated_reasoning_arr[i]
+                            seen_content_arr[i] = True
+
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=delta_message,
