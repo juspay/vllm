@@ -85,21 +85,29 @@ class MalformedToolCallError(Exception):
     """Raised when Kimi K2 emits unrecoverable tool-call output.
 
     Covers: unrecoverable/malformed tool-call JSON, post-repair schema
-    mismatch, leaked (unexpected) control tokens (``<|...|>``), or repeated
-    hallucinated tool-call-like text in the reasoning block. serving.py
-    converts this to a clean HTTP 500 so LiteLLM retries the request (the
-    model rolls the dice again) rather than the client receiving
-    empty/garbage tool calls with no retry signal.
+    mismatch, or a *repeated* hallucinated tool-call marker in the reasoning
+    block (the model looping). serving.py converts this to a clean HTTP 500 so
+    LiteLLM retries the request (the model rolls the dice again) rather than
+    the client receiving empty/garbage tool calls with no retry signal.
+
+    Single-occurrence leaks (an unexpected ``<|...|>`` control token, a stray
+    Anthropic-style ``<function_calls>``) are NOT raised -- they are logged and
+    passed through, because a 500 on legit content that merely mentions such a
+    token would fail every retry.
     """
 
 
 # Repeated hallucinated tool-call markers in reasoning => degenerate loop.
+# This is the only content heuristic that hard-fails (near-zero false-positive
+# rate; 3+ exact repeats in legit reasoning is implausible).
 _HALLUCINATED_TOOL_CALL_THRESHOLD = 3
 _HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
 # Anthropic-style tool calls the model sometimes hallucinates instead of
-# Kimi's native <|tool_call_begin|> format. Any occurrence is degenerate.
+# Kimi's native <|tool_call_begin|> format. Logged, not raised (a single
+# occurrence can appear in legit content that discusses the format).
 _HALLUCINATED_ANTHROPIC_TOOL_PATTERN = re.compile(r"<function_calls>|<invoke\b")
-# Any control token <|...|> leaking into reasoning/content is degenerate...
+# An unexpected control token <|...|> leaking into reasoning/content. Logged,
+# not raised (see MalformedToolCallError docstring)...
 _SPECIAL_TOKEN_PATTERN = re.compile(r"<\|\S+?\|>")
 # ...EXCEPT Kimi's own tool-call framing tokens, which the reasoning parser
 # deliberately keeps in content (so the tool parser can find them) and which
@@ -734,6 +742,9 @@ class OpenAIServingChat(OpenAIServing):
                     if self.reasoning_parser_cls is not None and not self.use_harmony:
                         if delta_message.reasoning:
                             accumulated_reasoning_arr[i] += delta_message.reasoning
+                            # Repeated hallucinated tool-call markers => the
+                            # model is looping; promoting this to content would
+                            # emit garbage, so fail closed and let LiteLLM retry.
                             if _detect_hallucinated_tool_calls_in_reasoning(
                                 accumulated_reasoning_arr[i]
                             ):
@@ -741,19 +752,24 @@ class OpenAIServingChat(OpenAIServing):
                                     "repeated hallucinated tool-call patterns "
                                     "in reasoning"
                                 )
+                            # Single-occurrence heuristics can match legit
+                            # content that merely discusses these tokens, and a
+                            # 500 there fails every retry. Log and pass through.
                             if _detect_anthropic_style_tool_calls(
                                 delta_message.reasoning
                             ):
-                                raise MalformedToolCallError(
-                                    "model hallucinated Anthropic-style tool "
-                                    "calls in reasoning"
+                                logger.warning(
+                                    "Kimi reasoning contains Anthropic-style "
+                                    "tool-call syntax (passing through)"
                                 )
                             leaked = _detect_special_tokens_in_text(
                                 delta_message.reasoning
                             )
                             if leaked:
-                                raise MalformedToolCallError(
-                                    f"special token {leaked!r} leaked into reasoning"
+                                logger.warning(
+                                    "Kimi reasoning leaked control token %r "
+                                    "(passing through)",
+                                    leaked,
                                 )
                         if delta_message.content:
                             seen_content_arr[i] = True
@@ -761,8 +777,10 @@ class OpenAIServingChat(OpenAIServing):
                                 delta_message.content
                             )
                             if leaked:
-                                raise MalformedToolCallError(
-                                    f"special token {leaked!r} leaked into content"
+                                logger.warning(
+                                    "Kimi content leaked control token %r "
+                                    "(passing through)",
+                                    leaked,
                                 )
 
                     # Log streaming delta if output logging is enabled
@@ -1089,29 +1107,36 @@ class OpenAIServingChat(OpenAIServing):
                         request,
                         enable_auto_tools=self.enable_auto_tools,
                     )
-                    # Detect degenerate Kimi output (repeated hallucinated tool
-                    # calls / leaked control tokens) and fail closed so LiteLLM
-                    # retries. Run on raw reasoning before it may be promoted.
+                    # Repeated hallucinated tool-call markers => the model is
+                    # looping; fail closed so LiteLLM retries instead of
+                    # promoting garbage to content. Single-occurrence heuristics
+                    # (leaked control token, Anthropic-style syntax) can match
+                    # legit content discussing these tokens, where a 500 fails
+                    # every retry -- log and pass through instead.
                     if self.reasoning_parser_cls is not None and reasoning:
                         if _detect_hallucinated_tool_calls_in_reasoning(reasoning):
                             raise MalformedToolCallError(
                                 "repeated hallucinated tool-call patterns in reasoning"
                             )
                         if _detect_anthropic_style_tool_calls(reasoning):
-                            raise MalformedToolCallError(
-                                "model hallucinated Anthropic-style tool calls "
-                                "in reasoning"
+                            logger.warning(
+                                "Kimi reasoning contains Anthropic-style tool-call "
+                                "syntax (passing through)"
                             )
                         leaked = _detect_special_tokens_in_text(reasoning)
                         if leaked:
-                            raise MalformedToolCallError(
-                                f"special token {leaked!r} leaked into reasoning"
+                            logger.warning(
+                                "Kimi reasoning leaked control token %r "
+                                "(passing through)",
+                                leaked,
                             )
                     if self.reasoning_parser_cls is not None and content:
                         leaked = _detect_special_tokens_in_text(content)
                         if leaked:
-                            raise MalformedToolCallError(
-                                f"special token {leaked!r} leaked into content"
+                            logger.warning(
+                                "Kimi content leaked control token %r "
+                                "(passing through)",
+                                leaked,
                             )
                     # reasoning -> content fallback: the model produced only
                     # reasoning (no </think>/tool section), so content is empty.

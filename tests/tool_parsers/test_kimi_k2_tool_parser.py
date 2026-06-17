@@ -592,6 +592,8 @@ class TestStreamingIntervals:
 import vllm.tool_parsers.kimi_k2_tool_parser as kimi_mod  # noqa: E402
 from vllm.entrypoints.openai.chat_completion.serving import (  # noqa: E402
     MalformedToolCallError,
+    _detect_anthropic_style_tool_calls,
+    _detect_hallucinated_tool_calls_in_reasoning,
     _detect_special_tokens_in_text,
 )
 
@@ -712,3 +714,13 @@ class TestServingLeakDetection:
 
     def test_plain_content_not_flagged(self):
         assert _detect_special_tokens_in_text("a < b | c > d, pipe|bar") is None
+
+    def test_repeated_marker_is_the_hardfail_boundary(self):
+        """Only >=3 repeats (the loop signal) is treated as degenerate; a
+        single/double occurrence is not (it gets logged + passed through)."""
+        one = "I will call <function_calls> once."
+        three = "<function_calls>" * 3
+        assert _detect_hallucinated_tool_calls_in_reasoning(one) is False
+        assert _detect_hallucinated_tool_calls_in_reasoning(three) is True
+        # A single Anthropic-style occurrence is detectable but only logged.
+        assert _detect_anthropic_style_tool_calls(one) is True
