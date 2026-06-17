@@ -478,6 +478,10 @@ class OpenAIServingChat(OpenAIServing):
             history_tool_call_cnt = 0
 
         previous_texts = [""] * num_choices
+        # Accumulated reasoning per choice, for hallucination detection. The
+        # reasoning -> content fallback itself is handled by the reasoning
+        # parser's get_streaming_fallback_content() via finalize_generation.
+        accumulated_reasoning_arr = [""] * num_choices
 
         try:
             if self.parser_cls is not None:
@@ -705,6 +709,47 @@ class OpenAIServingChat(OpenAIServing):
                             continue
                         delta_message = DeltaMessage()
 
+                    # Detect degenerate Kimi output (repeated hallucinated tool
+                    # calls / leaked control tokens) and fail closed so LiteLLM
+                    # retries. The reasoning -> content fallback is handled in
+                    # the parser (get_streaming_fallback_content).
+                    if self.reasoning_parser_cls is not None:
+                        if delta_message.reasoning:
+                            accumulated_reasoning_arr[i] += delta_message.reasoning
+                            if _detect_hallucinated_tool_calls_in_reasoning(
+                                accumulated_reasoning_arr[i]
+                            ):
+                                raise MalformedToolCallError(
+                                    "repeated hallucinated tool-call patterns "
+                                    "in reasoning"
+                                )
+                            if _detect_anthropic_style_tool_calls(
+                                delta_message.reasoning
+                            ):
+                                raise MalformedToolCallError(
+                                    "model hallucinated Anthropic-style tool "
+                                    "calls in reasoning"
+                                )
+                            leaked = _detect_special_tokens_in_text(
+                                delta_message.reasoning
+                            )
+                            if leaked:
+                                raise MalformedToolCallError(
+                                    f"special token {leaked!r} leaked into reasoning"
+                                )
+                        if delta_message.content:
+                            leaked = _detect_special_tokens_in_text(
+                                delta_message.content
+                            )
+                            if leaked:
+                                raise MalformedToolCallError(
+                                    f"special token {leaked!r} leaked into content"
+                                )
+                            if _LEAKED_REASONING_MARKER in delta_message.content:
+                                raise MalformedToolCallError(
+                                    "model leaked </thinking> into content"
+                                )
+
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
                         delta_content_parts = []
@@ -868,6 +913,15 @@ class OpenAIServingChat(OpenAIServing):
 
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
+        except MalformedToolCallError as e:
+            # Degenerate Kimi output. Emit a clean 500 so LiteLLM retries.
+            logger.warning("Malformed Kimi tool call (streaming): %s", e)
+            data = self.create_streaming_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            yield f"data: {data}\n\n"
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
@@ -994,11 +1048,53 @@ class OpenAIServingChat(OpenAIServing):
                 continue
 
             if parser is not None:
-                reasoning, content, tool_calls = parser.parse(
-                    output.text,
-                    request,
-                    enable_auto_tools=self.enable_auto_tools,
-                )
+                try:
+                    reasoning, content, tool_calls = parser.parse(
+                        output.text,
+                        request,
+                        enable_auto_tools=self.enable_auto_tools,
+                    )
+                    # Detect degenerate Kimi output (repeated hallucinated tool
+                    # calls / leaked control tokens) and fail closed so LiteLLM
+                    # retries. Run on raw reasoning before it may be promoted.
+                    if self.reasoning_parser_cls is not None and reasoning:
+                        if _detect_hallucinated_tool_calls_in_reasoning(reasoning):
+                            raise MalformedToolCallError(
+                                "repeated hallucinated tool-call patterns in reasoning"
+                            )
+                        if _detect_anthropic_style_tool_calls(reasoning):
+                            raise MalformedToolCallError(
+                                "model hallucinated Anthropic-style tool calls "
+                                "in reasoning"
+                            )
+                        leaked = _detect_special_tokens_in_text(reasoning)
+                        if leaked:
+                            raise MalformedToolCallError(
+                                f"special token {leaked!r} leaked into reasoning"
+                            )
+                    if self.reasoning_parser_cls is not None and content:
+                        leaked = _detect_special_tokens_in_text(content)
+                        if leaked:
+                            raise MalformedToolCallError(
+                                f"special token {leaked!r} leaked into content"
+                            )
+                    # reasoning -> content fallback: the model produced only
+                    # reasoning (no </think>/tool section), so content is empty.
+                    # Promote it so OpenAI clients don't receive null content.
+                    if (
+                        self.reasoning_parser_cls is not None
+                        and not content
+                        and reasoning
+                        and not tool_calls
+                    ):
+                        content = reasoning
+                except MalformedToolCallError as e:
+                    logger.warning("Malformed Kimi tool call (non-streaming): %s", e)
+                    return self.create_error_response(
+                        str(e),
+                        err_type="InternalServerError",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 if not request.include_reasoning:
                     reasoning = None
             else:
