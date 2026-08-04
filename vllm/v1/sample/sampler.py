@@ -13,6 +13,7 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+from vllm.v1.sample.token_id_mask import TokenIdLogitsMask
 
 _SAMPLING_EPS = 1e-5
 
@@ -62,12 +63,17 @@ class Sampler(nn.Module):
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
+        disallowed_token_ids: list[int] | None = None,
+        device: torch.device | str | None = None,
     ):
         super().__init__()
         self.topk_topp_sampler = TopKTopPSampler(logprobs_mode, use_fp64_gumbel)
         self.pin_memory = PIN_MEMORY
         self.logprobs_mode = logprobs_mode
         self.use_fp64_gumbel = use_fp64_gumbel
+        self.disallowed_token_ids = TokenIdLogitsMask(
+            disallowed_token_ids, device=device
+        )
 
     def forward(
         self,
@@ -374,6 +380,8 @@ class Sampler(nn.Module):
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool,
     ) -> torch.Tensor:
+        logits = self.disallowed_token_ids.apply(logits)
+
         bad_words_token_ids = sampling_metadata.bad_words_token_ids
         any_penalties_or_bad_words = (
             bool(bad_words_token_ids) or not sampling_metadata.no_penalties

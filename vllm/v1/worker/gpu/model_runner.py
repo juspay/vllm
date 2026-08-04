@@ -51,6 +51,10 @@ from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.sample.token_id_mask import (
+    resolve_disallowed_token_ids,
+    validate_token_id_mask_with_spec_decode,
+)
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -325,6 +329,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Initialize samplers. Model states may override via custom_sampler().
         if self.is_last_pp_rank and not self.is_pooling_model:
+            disallowed_token_ids = resolve_disallowed_token_ids(
+                self.vllm_config.additional_config,
+                self.model_config.get_vocab_size(),
+            )
+            validate_token_id_mask_with_spec_decode(
+                disallowed_token_ids,
+                self.speculative_config,
+            )
             self.sampler = Sampler(
                 max_num_reqs=self.max_num_reqs,
                 vocab_size=self.vocab_size,
@@ -333,6 +345,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logprobs_mode=self.model_config.logprobs_mode,
                 num_speculative_tokens=self.decode_query_len,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+                disallowed_token_ids=disallowed_token_ids,
             )
             custom = self.model_state.custom_sampler(self.sampler)
 

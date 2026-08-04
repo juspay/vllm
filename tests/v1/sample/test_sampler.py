@@ -411,6 +411,23 @@ def test_sampler_allowed_token_ids(
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_sampler_disallowed_token_ids(device: str):
+    torch.set_default_device(device)
+    fake_logits = _create_fake_logits(batch_size=2, vocab_size=VOCAB_SIZE)
+    sampling_metadata = _create_default_sampling_metadata(
+        NUM_OUTPUT_TOKENS, 2, VOCAB_SIZE, torch.device(device)
+    )
+    sampler = Sampler(disallowed_token_ids=[2, 7], device=device)
+
+    logits = sampler.apply_logits_processors(
+        fake_logits, sampling_metadata, predict_bonus_token=False
+    )
+
+    assert torch.isneginf(logits[:, [2, 7]]).all()
+    assert torch.isfinite(logits[:, [0, 1, 3, 4, 5, 6]]).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("batch_size", [1, 2, 32])
 @pytest.mark.parametrize("bad_words_lengths", [(1,), (1, 3), (2, 2)])
 def test_sampler_bad_words(

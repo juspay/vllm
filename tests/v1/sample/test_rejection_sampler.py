@@ -176,6 +176,42 @@ def test_early_mismatch(rejection_sampler):
     assert torch.equal(output.sampled_token_ids, expected)
 
 
+def test_disallowed_draft_token_is_rejected():
+    mock_sampler = Mock(spec=Sampler)
+    mock_sampler.logprobs_mode = "raw_logprobs"
+    rejection_sampler = RejectionSampler(
+        mock_sampler,
+        device=torch.device(DEVICE_TYPE),
+        disallowed_token_ids=[1],
+    )
+    spec_tokens = [[1]]
+    output_tokens = [[1, 3]]
+    metadata = create_sampling_metadata(all_greedy=True)
+    logits = create_logits_tensor(
+        output_tokens,
+        token_idx_to_override=2,
+    )
+    spec_decode_metadata = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(
+        rejection_sampler,
+        torch.tensor([output_tokens[0][-1]], device=logits.device),
+    )
+
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+
+    expected = torch.tensor(
+        [[2, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int,
+        device=logits.device,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
 def test_multiple_sequences(rejection_sampler):
     """Test handling multiple sequences of speculated tokens"""
     spec_tokens = [[1, 2], [3]]
