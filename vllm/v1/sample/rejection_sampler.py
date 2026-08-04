@@ -19,6 +19,7 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.sample.token_id_mask import TokenIdLogitsMask
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
@@ -62,9 +63,13 @@ class RejectionSampler(nn.Module):
         sampler: Sampler,
         spec_config: SpeculativeConfig | None = None,
         device: torch.device | None = None,
+        disallowed_token_ids: list[int] | None = None,
     ):
         super().__init__()
         self.sampler = sampler
+        self.disallowed_token_ids = TokenIdLogitsMask(
+            disallowed_token_ids, device=device
+        )
         self.use_fp64_gumbel = getattr(sampler, "use_fp64_gumbel", False)
         logprobs_mode = self.sampler.logprobs_mode
         self.is_processed_logprobs_mode = logprobs_mode in (
@@ -294,6 +299,8 @@ class RejectionSampler(nn.Module):
         sampling_metadata: SamplingMetadata,
         metadata: SpecDecodeMetadata,
     ) -> torch.Tensor:
+        logits = self.disallowed_token_ids.apply(logits)
+
         has_penalties = not sampling_metadata.no_penalties
         any_penalties_or_bad_words = (
             sampling_metadata.bad_words_token_ids or has_penalties

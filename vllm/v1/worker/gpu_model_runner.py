@@ -190,6 +190,10 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.sample.token_id_mask import (
+    resolve_disallowed_token_ids,
+    validate_token_id_mask_with_spec_decode,
+)
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -541,9 +545,19 @@ class GPUModelRunner(
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
+        self.disallowed_token_ids = resolve_disallowed_token_ids(
+            self.vllm_config.additional_config,
+            self.model_config.get_vocab_size(),
+        )
+        validate_token_id_mask_with_spec_decode(
+            self.disallowed_token_ids,
+            self.speculative_config,
+        )
         self.sampler = Sampler(
             logprobs_mode=self.model_config.logprobs_mode,
             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+            disallowed_token_ids=self.disallowed_token_ids,
+            device=self.device,
         )
 
         self.eplb_state: EplbState | None = None
@@ -653,7 +667,10 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(
-                self.sampler, self.speculative_config, self.device
+                self.sampler,
+                self.speculative_config,
+                self.device,
+                self.disallowed_token_ids,
             )
 
         self.num_spec_tokens = 0
